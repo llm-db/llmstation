@@ -9,7 +9,6 @@ import argparse
 import gc
 import itertools
 import os
-import time
 
 import datasets
 import torch
@@ -118,12 +117,18 @@ def run_peft(
     forward_timings = []
     total_timings = []
     for _ in range(trials):
-        start = time.time()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_forward_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
 
         step, inputs = next(dataloader_iter)
         inputs.to(torch.cuda.current_device())
         outputs = model(**inputs)
-        forward_timings.append(time.time() - start)
+
+        end_forward_event.record()
+        torch.cuda.synchronize()
+        forward_timings.append(start_event.elapsed_time(end_forward_event) / 1000.0)
 
         loss = outputs.loss
         loss.backward()
@@ -131,8 +136,9 @@ def run_peft(
             optimizer.step()
             optimizer.zero_grad()
 
-        end = time.time()
-        total_timings.append(end - start)
+        end_event.record()
+        torch.cuda.synchronize()
+        total_timings.append(start_event.elapsed_time(end_event) / 1000.0)
 
     if local_rank != 0:
         return

@@ -8,7 +8,6 @@ https://github.com/microsoft/DeepSpeedExamples/blob/master/inference/huggingface
 import argparse
 import gc
 import os
-import time
 
 import torch
 from transformers import (
@@ -93,13 +92,19 @@ def run_generation(
     prefill_timings = []
     total_timings = []
     for _ in range(trials):
-        start = time.time()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+
         with torch.no_grad():
             model.base_model.model.stage = "prefill"
             output_ids = model.generate(**input_tokens, max_new_tokens=gen_len, do_sample=False)
             prefill_timings.append(model.base_model.model.__duration__)
-        end = time.time()
-        total_timings.append(end - start)
+
+        end_event.record()
+        torch.cuda.synchronize()
+        total_timings.append(start_event.elapsed_time(end_event) / 1000.0)
+
 
     if local_rank != 0:
         return
