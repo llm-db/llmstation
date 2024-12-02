@@ -1,6 +1,6 @@
-import random
-import torch
 import time
+
+import torch
 
 KB = 1 << 10
 MB = 1 << 20

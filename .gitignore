@@ -1,0 +1,7 @@
+__pycache__
+results
+*.ipynb
+benchmarks/naive_chunk/tmp
+benchmarks/naive_chunk/naive*
+benchmarks/naive_chunk/performance/*mod.py
+scripts/naive_chunk/correctness/*FA.sh
