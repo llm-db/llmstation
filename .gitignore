@@ -1,7 +1,12 @@
 __pycache__
 results
 *.ipynb
+*.pdf
+chunk-*
+*chunk+*
+requirements_*
 benchmarks/naive_chunk/tmp
 benchmarks/naive_chunk/naive*
 benchmarks/naive_chunk/performance/*mod.py
-scripts/naive_chunk/correctness/*FA.sh
+benchmarks/naive_chunk_archived/
+scripts/naive_chunk_archived

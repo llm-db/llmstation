@@ -1,6 +1,6 @@
 #!/bin/bash
 
-python -m benchmarks.naive_chunk.correctness.chunked_peft \
+python -m benchmarks.chunked_peft.correctness.correctness_check \
        --model_name /pub/scratch/yanghao/models/huggingface/Qwen/Qwen2.5-1.5B \
        --dataset_name yahma/alpaca-cleaned \
        --trials 100 \
@@ -8,10 +8,12 @@ python -m benchmarks.naive_chunk.correctness.chunked_peft \
        --gradient_accumulation_steps 1 \
        --seq_len 256 \
        --chunk_size 128 \
-       --local_rank 1 \
+       --tolerances 1e-3 1e-3 \
+       --local_ranks 2 3 \
        --pin_memory 0 \
        --quant_bits 64 \
        --quant_group_size 64 \
        --cache_dir /pub/scratch/yanghao/datasets/ \
-       --dtype fp64 \
-       --print_out n
+       --dtype fp16 \
+       --attn_impl flash_attention_2 \
+       --print_out y

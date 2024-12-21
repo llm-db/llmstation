@@ -11,18 +11,18 @@ from transformers import (
     DynamicCache,
 )
 
-from benchmarks.naive_chunk.data_utils import (
+from benchmarks.chunked_peft.data_utils import (
     load_data,
 )
 
-from benchmarks.naive_chunk.chunk_utils import (
+from benchmarks.chunked_peft.chunk_utils import (
     printer,
     fix_determinism,
     create_chunk_model,
     get_dtype,
 )
 
-from benchmarks.naive_chunk.timer_utils import (
+from benchmarks.chunked_peft.timer_utils import (
     get_stat_str,
 )
 
@@ -36,12 +36,12 @@ def whole_peft_forward(model: torch.nn.Module,
 def whole_peft_backward(model: torch.nn.Module,
                         loss: torch.nn.Module,
                         check_grad: bool = False) -> None:
-    printer.print(f"bwd pass in the whole")
+    # printer.print(f"bwd pass in the whole")
     loss.backward()
-    printer.print(f"grad of last layer v.proj: {model.base_model.        \
-                                                model.model.layers[25].  \
-                                                self_attn.v_proj.lora_B. \
-                                                default.weight.grad}")
+    # printer.print(f"grad of last layer v.proj: {model.base_model.        \
+    #                                             model.model.layers[-1].  \
+    #                                             self_attn.v_proj.lora_B. \
+    #                                             default.weight.grad}")
 
 def run_whole_peft_step(model: torch.nn.Module,
                         optimizer: torch.optim.Optimizer,
@@ -92,12 +92,12 @@ def run_whole_peft_holistic(model: torch.nn.Module,
                             total_timings: List[float] = [],
                             ) -> None:
     valid_step: int = 0
-    num_chunks: int = seq_len // chunk_size
-    len_thresh: int = chunk_size * (num_chunks-1)
+    # num_chunks: int = seq_len // chunk_size
+    # len_thresh: int = chunk_size * (num_chunks-1)
     for step, inputs in tqdm(dataloader_iter):
         # skip not-long-enough samples to ensure the full chunk number
-        if inputs.input_ids.shape[1] <= len_thresh:
-            continue
+        # if inputs.input_ids.shape[1] <= len_thresh:
+        #     continue
         run_whole_peft_step(model, optimizer, valid_step, inputs,
                             do_backward=do_backward,
                             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -126,7 +126,7 @@ if __name__ == "__main__":
     parser.add_argument("--quant_group_size", type=int, default=64, help="model weight quantization group size")
     parser.add_argument("--cache_dir", type=str, default=".", help="cache dir for model name")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16", "fp32", "fp64"])
-    parser.add_argument("--attn_impl", type=str, default="flash_attention_2", choices=["eager", "flash_attention_2"], help="attention implementation")
+    parser.add_argument("--attn_impl", type=str, default="flash_attention_2", choices=["eager", "flash_attention_2", "math", "mem_efficient"], help="torch attention implementation")
     parser.add_argument("--seed", type=int, default=42, help="random seed")
     parser.add_argument("--res_folder", type=str, default=".", help="path to store benchmarking results")
     parser.add_argument("--print_out", type=str, default="y", help="y: print info; n: no show")

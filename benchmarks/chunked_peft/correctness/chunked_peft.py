@@ -11,38 +11,34 @@ from transformers import (
     DynamicCache,
 )
 
-from benchmarks.naive_chunk.data_utils import (
+from benchmarks.chunked_peft.data_utils import (
     load_data,
 )
 
-from benchmarks.naive_chunk.chunk_utils import (
+from benchmarks.chunked_peft.chunk_utils import (
+    ChunkCache,
     printer,
     INVALID_TARGET,
     fix_determinism,
+    fixed_cross_entropy,
     get_learnable_param_grad,
     create_chunk_model,
     get_dtype,
 )
 
-def fixed_cross_entropy(source, target, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs):
-    reduction = "sum" if num_items_in_batch is not None else "mean"
-    loss = torch.nn.functional.cross_entropy(source, target, ignore_index=ignore_index, reduction=reduction)
-    if reduction == "sum":
-        loss = loss / num_items_in_batch
-    return loss
+from benchmarks.chunked_peft.monkey_patching.monkey_patching import open_correctness_mode
 
 
-def chunked_peft_forward(model: torch.nn.Module, 
-                         inputs: Union[List[int], Dict],
-                         chunk_size: int,
-                        ) -> Tuple[List[torch.nn.Module], torch.Tensor]:
+def chunked_peft_forward_naive(model: torch.nn.Module, 
+                               inputs: Union[List[int], Dict],
+                               chunk_size: int,
+                               ) -> Tuple[List[torch.nn.Module], torch.Tensor]:
     assert chunk_size >= 1, "chunk size should be a postive integer"
     num_total_tokens: int = inputs.input_ids.shape[1]
     num_processed_tokens: int = 0
-    past_query_key_values = DynamicCache().to(device=torch.cuda.current_device())
+    past_key_values = DynamicCache().to(device=torch.cuda.current_device())
     num_valid_tokens: torch.Tensor = (inputs.labels != INVALID_TARGET).sum(dim=-1, keepdim=True)\
                                                                       .to(device=torch.cuda.current_device()) - 1
-    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=INVALID_TARGET, reduction="none")
     losses: List[torch.nn.Module] = []
     logits: List[torch.Tensor] = []
     while num_processed_tokens < num_total_tokens:
@@ -57,11 +53,11 @@ def chunked_peft_forward(model: torch.nn.Module,
         cur_inputs: Dict = {"input_ids": cur_input_ids.to(device=torch.cuda.current_device()),
                             "attention_mask": attention_mask.to(device=torch.cuda.current_device()),
                             "cache_position": cache_position,
-                            "past_key_values": past_query_key_values,
+                            "past_key_values": past_key_values,
                             "use_cache": True,
                             }
         
-        # TODO: Check grad ckpt's implications on performance
+        # TODO: check grad ckpt's implications on performance
         # model.gradient_checkpointing_enable(dict(use_reentrant=False))
         outputs = model(**cur_inputs)
 
@@ -93,6 +89,77 @@ def chunked_peft_forward(model: torch.nn.Module,
     whole_logits = torch.cat(logits, dim=1)   
     return losses, whole_logits
 
+
+def chunked_peft_forward_separate(model: torch.nn.Module, 
+                                  inputs: Union[List[int], Dict],
+                                  chunk_size: int,
+                                  ) -> Tuple[List[torch.nn.Module], torch.Tensor]:
+    assert chunk_size >= 1, "chunk size should be a postive integer"
+    num_total_tokens: int = inputs.input_ids.shape[1]
+    num_processed_tokens: int = 0
+    past_key_values = ChunkCache(attn_impl=model.config._attn_implementation).to(device=torch.cuda.current_device())
+    num_valid_tokens: torch.Tensor = (inputs.labels != INVALID_TARGET).sum(dim=-1, keepdim=True)\
+                                                                      .to(device=torch.cuda.current_device()) - 1
+    losses: List[torch.nn.Module] = []
+    logits: List[torch.Tensor] = []
+    while num_processed_tokens < num_total_tokens:
+        num_cur_step: int = min(chunk_size, 
+                                num_total_tokens-num_processed_tokens)
+        num_will_complete_tokens = num_processed_tokens + num_cur_step
+        cache_position: torch.Tensor = torch.arange(start=num_processed_tokens, 
+                                                    end=num_will_complete_tokens,
+                                                    device=torch.cuda.current_device())
+        attention_mask: torch.Tensor = inputs.attention_mask[:, :num_will_complete_tokens]
+        cur_input_ids: torch.Tensor  = inputs.input_ids[:, num_processed_tokens: num_will_complete_tokens]
+        cur_inputs: Dict = {"input_ids": cur_input_ids.to(device=torch.cuda.current_device()),
+                            "attention_mask": attention_mask.to(device=torch.cuda.current_device()),
+                            "cache_position": cache_position,
+                            "past_key_values": past_key_values,
+                            "use_cache": True,
+                            }
+        
+        # TODO: check grad ckpt's implications on performance
+        # model.gradient_checkpointing_enable(dict(use_reentrant=False))
+        outputs = model(**cur_inputs)
+
+
+        # print(f"right after a model call, len of key_grads_cache: {len(outputs.past_key_values.key_grads_cache)}")
+
+        # NOTE: detach prev tensor from the computation graph of new chunks
+        # past_key_values = ChunkCache(prev_cache=outputs.past_key_values)
+        past_key_values: ChunkCache = outputs.past_key_values
+        past_key_values.detach_kv_cache()
+
+        cur_logits: torch.Tensor = outputs.logits
+        
+        # (batch size, len, class) -> (batch size, class, len) -> (batch size, len) -> (batch size, 1)
+        if num_will_complete_tokens < num_total_tokens:
+            shift_logits:  torch.Tensor = cur_logits[..., :, :].contiguous()
+            shift_targets: torch.Tensor = inputs.labels[:, num_processed_tokens+1: num_will_complete_tokens+1] \
+                                                .to(device=torch.cuda.current_device())
+        else: # last chunk, ignore the last pos of logits
+            shift_logits:  torch.Tensor = cur_logits[..., :-1, :].contiguous()
+            shift_targets: torch.Tensor = inputs.labels[:, num_processed_tokens+1: num_will_complete_tokens] \
+                                                .to(device=torch.cuda.current_device())
+        
+        # NOTE: here we only consider batch_size = 1
+        # TODO: extend to batch_size > 1
+        shift_targets = shift_targets.view(-1)
+        shift_logits  = shift_logits.view(-1, shift_logits.shape[-1])
+        shift_targets = shift_targets.to(shift_logits.device)
+        cur_loss = fixed_cross_entropy(shift_logits, shift_targets, 1, INVALID_TARGET)
+        
+        # cur_loss: torch.Tensor = (loss_fn(shift_logits.permute(0, 2, 1), 
+        #                                   shift_targets)).sum(dim=-1, keepdim=True)
+        cur_loss /= num_valid_tokens.item() # sum of avg-token-loss in current chunk
+        losses.append(cur_loss)
+        logits.append(outputs.logits)
+        num_processed_tokens += num_cur_step
+
+    whole_logits = torch.cat(logits, dim=1)   
+    return losses, whole_logits
+
+
 def chunked_peft_backward(model: torch.nn.Module,
                           losses: List[torch.nn.Module],
                           check_grad: bool = False) -> None:
@@ -102,7 +169,7 @@ def chunked_peft_backward(model: torch.nn.Module,
         printer.print(f"bwd pass w. chunk: {n-idx-1}")
         loss.backward(retain_graph=(False if idx == n-1 else True))
         printer.print(f"grad of last layer v.proj: {model.base_model.        \
-                                                    model.model.layers[25].  \
+                                                    model.model.layers[-1].  \
                                                     self_attn.v_proj.lora_B. \
                                                     default.weight.grad}")
 
@@ -113,7 +180,7 @@ def chunked_peft_backward_whole(model: torch.nn.Module,
     loss = sum(losses)
     loss.backward()
     printer.print(f"grad of last layer v.proj: {model.base_model.        \
-                                                model.model.layers[25].  \
+                                                model.model.layers[-1].  \
                                                 self_attn.v_proj.lora_B. \
                                                 default.weight.grad}")
 
@@ -126,7 +193,7 @@ def chunked_peft_backward_forward_order(model: torch.nn.Module,
         printer.print(f"bwd pass w. chunk: {idx} (forward chunk order)")
         loss.backward(retain_graph=(False if idx == n-1 else True))
         printer.print(f"grad of last layer v.proj: {model.base_model.        \
-                                                    model.model.layers[25].  \
+                                                    model.model.layers[-1].  \
                                                     self_attn.v_proj.lora_B. \
                                                     default.weight.grad}")
 
@@ -139,11 +206,19 @@ def run_chunked_peft_step(model: torch.nn.Module,
                           chunk_size: int,
                           local_rank: int,
                           check_grad: bool = False,
+                          chunk_impl: str = "separate",
                           backward_whole: bool = False,
                           backward_order: bool = True,
                           ) -> Tuple[torch.tensor, torch.tensor, Optional[OrderedDict]]:
     torch.cuda.set_device(local_rank)
-    losses, logits = chunked_peft_forward(model=model, inputs=inputs, chunk_size=chunk_size)
+    
+    if chunk_impl == "naive":
+        losses, logits = chunked_peft_forward_naive(model=model, inputs=inputs, chunk_size=chunk_size)
+    elif chunk_impl == "separate":
+        losses, logits = chunked_peft_forward_separate(model=model, inputs=inputs, chunk_size=chunk_size)
+    else:
+        raise NotImplementedError()
+
     torch.cuda.synchronize()
     result = (sum(losses), logits, )
     if do_backward:
@@ -171,6 +246,7 @@ def run_chunked_peft_holistic(model: torch.nn.Module,
                               chunk_size: int,
                               local_rank: int,
                               check_grad: bool = False,
+                              chunk_impl: str = "separate",
                               backward_whole: bool = False,
                               backward_order: bool = True,
                               ) -> None:
@@ -181,8 +257,9 @@ def run_chunked_peft_holistic(model: torch.nn.Module,
                               chunk_size=chunk_size,
                               local_rank=local_rank,
                               check_grad=check_grad,
+                              chunk_impl=chunk_impl,
                               backward_whole=backward_whole,
-                              backward_order=backward_order)
+                              backward_order=backward_order,)
         if step >= num_run_steps:
             break
 
@@ -201,6 +278,8 @@ if __name__ == "__main__":
     parser.add_argument("--quant_group_size", type=int, default=64, help="model weight quantization group size")
     parser.add_argument("--cache_dir", type=str, default=".", help="cache dir for model name")
     parser.add_argument("--dtype", type=str, default="fp64", choices=["fp16", "bf16", "fp32", "fp64"])
+    parser.add_argument("--attn_impl", type=str, default="flash_attention_2", choices=["eager", "flash_attention_2", "math", "mem_efficient"], help="torch attention implementation")
+    parser.add_argument("--chunk_impl", type=str, default="separate", choices=["naive", "separate"], help="chunked BWD implementation")
     parser.add_argument("--print_out", type=str, default="y", help="y: print info; n: no show")
     args = parser.parse_args()
 
@@ -211,6 +290,11 @@ if __name__ == "__main__":
 
     # open printer
     printer.open() if args.print_out == "y" else printer.close()
+
+    # use monkey patching to overwrite transformers Llama
+    assert args.attn_impl != "eager", "no support for eager-based chunked PEFT, " + \
+                             "as it's used for correctness check and can be replaced by math..."
+    open_correctness_mode()
 
     # create dataloader
     dataloader_iter = load_data(model_name=args.model_name, 
@@ -227,7 +311,11 @@ if __name__ == "__main__":
                                cache_dir=args.cache_dir,
                                local_ranks=args.local_rank,
                                dtype=get_dtype(args.dtype),
-                               attn_impl="eager",)
+                               attn_impl=args.attn_impl,)
+    
+    # FIXME: add grad print
+    # add_print_backward_hooks(model)
+
     # create optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     # run chunked peft
@@ -240,5 +328,6 @@ if __name__ == "__main__":
                               chunk_size=args.chunk_size,
                               local_rank=args.local_rank,
                               check_grad=True,
+                              chunk_impl=args.chunk_impl,
                               backward_whole=False,
-                              backward_order=True)
+                              backward_order=True,)

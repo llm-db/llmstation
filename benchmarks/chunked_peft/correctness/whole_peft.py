@@ -11,11 +11,11 @@ from transformers import (
     DynamicCache,
 )
 
-from benchmarks.naive_chunk.data_utils import (
+from benchmarks.chunked_peft.data_utils import (
     load_data,
 )
 
-from benchmarks.naive_chunk.chunk_utils import (
+from benchmarks.chunked_peft.chunk_utils import (
     printer,
     fix_determinism,
     get_learnable_param_grad,
@@ -37,7 +37,7 @@ def whole_peft_backward(model: torch.nn.Module,
     printer.print(f"bwd pass in the whole")
     loss.backward()
     printer.print(f"grad of last layer v.proj: {model.base_model.        \
-                                                model.model.layers[25].  \
+                                                model.model.layers[-1].  \
                                                 self_attn.v_proj.lora_B. \
                                                 default.weight.grad}")
 
@@ -98,6 +98,7 @@ if __name__ == "__main__":
     parser.add_argument("--quant_group_size", type=int, default=64, help="model weight quantization group size")
     parser.add_argument("--cache_dir", type=str, default=".", help="cache dir for model name")
     parser.add_argument("--dtype", type=str, default="fp64", choices=["fp16", "bf16", "fp32", "fp64"])
+    parser.add_argument("--attn_impl", type=str, default="flash_attention_2", choices=["eager", "flash_attention_2", "sdpa"], help="attention implementation")
     parser.add_argument("--print_out", type=str, default="y", help="y: print info; n: no show")
     args = parser.parse_args()
 
@@ -124,7 +125,7 @@ if __name__ == "__main__":
                                cache_dir=args.cache_dir,
                                local_ranks=args.local_rank,
                                dtype=get_dtype(args.dtype),
-                               attn_impl="eager",)
+                               attn_impl=args.attn_impl,)
     # create optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     # run whole peft

@@ -57,12 +57,12 @@ def load_data(model_name: str,
     if dataset_name.find("alpaca") != -1:
         dataset = dataset.map(lambda sample_raw: prepare_alpaca(sample_raw), remove_columns=dataset["train"].column_names)
     elif dataset_name.find("flan") != -1:
-        dataset['train'] = dataset['train'].select(range(100000)) # only keep first 100000 samples
+        dataset['train'] = dataset['train'].select(range(100000)) # FIXME: only keep first 100000 samples for test efficiency
         dataset = dataset.map(lambda sample_raw: prepare_flan_flat(sample_raw), remove_columns=dataset["train"].column_names)
     else:
         raise NotImplemented()
     
-    # NOTE: only keep long-enough samples (# tokens == seq_len)
+    # FIXME: only keep long-enough samples (# tokens == seq_len) for throughput testing
     print(f"# long-enough samples: {sum([ 1 for input_ids in dataset['train']['input_ids'] if len(input_ids) == seq_len ])}")
     # print([ len(input_ids) for input_ids in dataset['train']['input_ids'] ])
     dataset['train'] = dataset['train'].filter(lambda tokens: len(tokens['input_ids']) == seq_len)

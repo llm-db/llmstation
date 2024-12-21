@@ -8,11 +8,11 @@ from typing import List, Tuple, Optional
 import torch
 from tqdm import tqdm
 
-from benchmarks.naive_chunk.data_utils import (
+from benchmarks.chunked_peft.data_utils import (
     load_data,
 )
 
-from benchmarks.naive_chunk.chunk_utils import (
+from benchmarks.chunked_peft.chunk_utils import (
     printer,
     fix_determinism,
     copy_input,
@@ -20,13 +20,16 @@ from benchmarks.naive_chunk.chunk_utils import (
     get_dtype,
 )
 
-from benchmarks.naive_chunk.correctness.whole_peft import (
+from benchmarks.chunked_peft.correctness.whole_peft import (
     run_whole_peft_step
 )
 
-from benchmarks.naive_chunk.correctness.chunked_peft import (
+from benchmarks.chunked_peft.correctness.chunked_peft import (
     run_chunked_peft_step
 )
+
+from benchmarks.chunked_peft.monkey_patching.monkey_patching import open_correctness_mode
+
 
 def check_results(res_tuple_1, res_tuple_2, tolerance: float = 1e-5, 
                   check_grad: bool = False, grad_tolerance=1e-6):
@@ -74,6 +77,7 @@ def run_and_check_results(models: Tuple[torch.nn.Module, torch.nn.Module],
                           local_ranks: Tuple[int, int],
                           tolerances: Tuple[float, float],
                           check_grad: bool = False,
+                          chunk_impl: str = "separate",
                           backward_whole: bool = False,
                           backward_order: bool = True,
                           ) -> List[Tuple[torch.tensor, torch.tensor, Optional[OrderedDict]]]:
@@ -100,6 +104,7 @@ def run_and_check_results(models: Tuple[torch.nn.Module, torch.nn.Module],
                                              chunk_size=chunk_size,
                                              local_rank=local_ranks[1],
                                              check_grad=check_grad,
+                                             chunk_impl=chunk_impl,
                                              backward_whole=backward_whole,
                                              backward_order=backward_order)
         # check result
@@ -128,7 +133,9 @@ if __name__ == "__main__":
     parser.add_argument("--quant_bits", type=int, default=16, help="model weight quantization bits; either 4 or 8")
     parser.add_argument("--quant_group_size", type=int, default=64, help="model weight quantization group size")
     parser.add_argument("--cache_dir", type=str, default=".", help="cache dir for model name")
-    parser.add_argument("--dtype", type=str, default="fp64", choices=["fp16", "bf16", "fp32", "fp64"])
+    parser.add_argument("--dtype", type=str, default="fp64", choices=["bf16", "fp32", "fp64"])
+    parser.add_argument("--attn_impl", type=str, default="flash_attention_2", choices=["eager", "flash_attention_2", "math", "flash", "mem_efficient"], help="torch attention implementation")
+    parser.add_argument("--chunk_impl", type=str, default="separate", choices=["naive", "separate"], help="chunked BWD implementation")
     parser.add_argument("--tolerances", type=float, nargs='+', help="2-element tuple: first is loss/logits tolerance; second is grads tolerance")
     parser.add_argument("--print_out", type=str, default="y", help="y: print info; n: no show")
     args = parser.parse_args()
@@ -140,6 +147,11 @@ if __name__ == "__main__":
 
     # open printer
     printer.open() if args.print_out == "y" else printer.close()
+
+    # use monkey patching to overwrite transformers Llama
+    assert args.attn_impl != "eager", "no support for eager-based chunked PEFT, " + \
+                             "as it's used for correctness check and can be replaced by math..."
+    open_correctness_mode()
 
     # create dataloader
     dataloader_iter = load_data(model_name=args.model_name, 
@@ -156,8 +168,7 @@ if __name__ == "__main__":
                                 cache_dir=args.cache_dir,
                                 local_ranks=args.local_ranks,
                                 dtype=get_dtype(args.dtype),
-                                attn_impl="eager",)
-                                # attn_impl="flash_attention_2",)
+                                attn_impl=args.attn_impl,)
     # create optimizer
     optimizers = (torch.optim.AdamW(models[0].parameters(), lr=3e-4), \
                   torch.optim.AdamW(models[1].parameters(), lr=3e-4),)
@@ -173,5 +184,6 @@ if __name__ == "__main__":
                           tolerances=tuple(args.tolerances),
                           local_ranks=args.local_ranks,
                           check_grad=True,
+                          chunk_impl=args.chunk_impl,
                           backward_whole=False,
                           backward_order=True)

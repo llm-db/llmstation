@@ -1,6 +1,8 @@
 #!/bin/bash
-dtypes=("bf16")
-seq_lens=(512 1024)
+dtypes=("bf16" "fp16")
+# seq_lens=(512 1024)
+# seq_lens=(512)
+seq_lens=(1024)
 # seeds=(39 40 41 42 43 44 45)
 seeds=(42)
 for dtype in ${dtypes[@]}
@@ -13,7 +15,7 @@ do
               for seed in ${seeds[@]}
               do
               echo current seed: $seed
-              python -m benchmarks.naive_chunk.performance.whole_peft_FA \
+              python -m benchmarks.chunked_peft.performance.whole_peft \
                      --model_name /pub/scratch/yanghao/models/huggingface/meta-llama/Llama-3.1-8B \
                      --dataset_name sordonia/flan-10k-flat \
                      --trials 20 \
@@ -26,10 +28,10 @@ do
                      --quant_bits 16 \
                      --quant_group_size 64 \
                      --cache_dir /pub/scratch/yanghao/datasets/ \
+                     --attn_impl flash_attention_2 \
                      --dtype $dtype \
-                     --attn_impl eager \
                      --seed $seed \
-                     --res_folder results/naive_chunk/performance/new/ \
+                     --res_folder results/naive_chunk/performance/ \
                      --print_out n
               done
        done
