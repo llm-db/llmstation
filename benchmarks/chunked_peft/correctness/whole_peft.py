@@ -7,9 +7,6 @@ from typing import List, Dict, Tuple, Union, Optional
 
 import torch
 from tqdm import tqdm
-from transformers import (
-    DynamicCache,
-)
 
 from benchmarks.chunked_peft.data_utils import (
     load_data,
@@ -17,7 +14,7 @@ from benchmarks.chunked_peft.data_utils import (
 
 from benchmarks.chunked_peft.chunk_utils import (
     printer,
-    fix_determinism,
+    fix_randomness_determinism,
     get_learnable_param_grad,
     create_chunk_model,
     get_dtype,
@@ -28,7 +25,7 @@ def whole_peft_forward(model: torch.nn.Module,
                        inputs: Union[List[int], Dict],
                       ) -> Tuple[List[torch.nn.Module], torch.Tensor]:
     inputs.to(torch.cuda.current_device())
-    outputs = model(**inputs)
+    outputs = model(**inputs, use_cache=False)
     return outputs.loss, outputs.logits
 
 def whole_peft_backward(model: torch.nn.Module,
@@ -105,7 +102,7 @@ if __name__ == "__main__":
     gc.collect()
 
     # fix random seed
-    fix_determinism()
+    fix_randomness_determinism()
 
     # open printer
     printer.open() if args.print_out == "y" else printer.close()
@@ -123,7 +120,7 @@ if __name__ == "__main__":
                                quant_bits=args.quant_bits,
                                quant_group_size=args.quant_group_size,
                                cache_dir=args.cache_dir,
-                               local_ranks=args.local_rank,
+                               local_rank=args.local_rank,
                                dtype=get_dtype(args.dtype),
                                attn_impl=args.attn_impl,)
     # create optimizer

@@ -19,14 +19,14 @@ from benchmarks.chunked_peft.chunk_utils import (
     ChunkCache,
     printer,
     INVALID_TARGET,
-    fix_determinism,
+    fix_randomness_determinism,
     fixed_cross_entropy,
     get_learnable_param_grad,
     create_chunk_model,
     get_dtype,
 )
 
-from benchmarks.chunked_peft.monkey_patching.monkey_patching import open_correctness_mode
+from benchmarks.chunked_peft.monkey_patching import open_correctness_mode
 
 
 def chunked_peft_forward_naive(model: torch.nn.Module, 
@@ -97,7 +97,8 @@ def chunked_peft_forward_separate(model: torch.nn.Module,
     assert chunk_size >= 1, "chunk size should be a postive integer"
     num_total_tokens: int = inputs.input_ids.shape[1]
     num_processed_tokens: int = 0
-    past_key_values = ChunkCache(attn_impl=model.config._attn_implementation).to(device=torch.cuda.current_device())
+    past_key_values = ChunkCache(attn_impl=model.config._attn_implementation)#.to(device=torch.cuda.current_device())
+    # past_key_values = ChunkCache(attn_impl=model.config._attn_implementation).to(device=torch.cuda.current_device())
     num_valid_tokens: torch.Tensor = (inputs.labels != INVALID_TARGET).sum(dim=-1, keepdim=True)\
                                                                       .to(device=torch.cuda.current_device()) - 1
     losses: List[torch.nn.Module] = []
@@ -167,7 +168,8 @@ def chunked_peft_backward(model: torch.nn.Module,
     n: int = len(losses)
     for idx, loss in enumerate(losses[::-1]):
         printer.print(f"bwd pass w. chunk: {n-idx-1}")
-        loss.backward(retain_graph=(False if idx == n-1 else True))
+        # loss.backward(retain_graph=(False if idx == n-1 else True))
+        loss.backward(retain_graph=False)
         printer.print(f"grad of last layer v.proj: {model.base_model.        \
                                                     model.model.layers[-1].  \
                                                     self_attn.v_proj.lora_B. \
@@ -286,7 +288,7 @@ if __name__ == "__main__":
     gc.collect()
 
     # fix random seed
-    fix_determinism()
+    fix_randomness_determinism()
 
     # open printer
     printer.open() if args.print_out == "y" else printer.close()
@@ -309,7 +311,7 @@ if __name__ == "__main__":
                                quant_bits=args.quant_bits,
                                quant_group_size=args.quant_group_size,
                                cache_dir=args.cache_dir,
-                               local_ranks=args.local_rank,
+                               local_rank=args.local_rank,
                                dtype=get_dtype(args.dtype),
                                attn_impl=args.attn_impl,)
     

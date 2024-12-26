@@ -2,14 +2,10 @@ import os
 import gc
 import argparse
 import itertools
-from collections import OrderedDict
-from typing import List, Dict, Tuple, Union, Optional
+from typing import List, Dict, Tuple, Union
 
 import torch
 from tqdm import tqdm
-from transformers import (
-    DynamicCache,
-)
 
 from benchmarks.chunked_peft.data_utils import (
     load_data,
@@ -17,7 +13,7 @@ from benchmarks.chunked_peft.data_utils import (
 
 from benchmarks.chunked_peft.chunk_utils import (
     printer,
-    fix_determinism,
+    fix_randomness_determinism,
     create_chunk_model,
     get_dtype,
 )
@@ -30,18 +26,13 @@ def whole_peft_forward(model: torch.nn.Module,
                        inputs: Union[List[int], Dict],
                       ) -> Tuple[List[torch.nn.Module], torch.Tensor]:
     inputs.to(torch.cuda.current_device())
-    outputs = model(**inputs)
-    return outputs.loss, outputs.logits
+    outputs = model(**inputs, use_cache=False)
+    return outputs.loss, None
 
 def whole_peft_backward(model: torch.nn.Module,
                         loss: torch.nn.Module,
                         check_grad: bool = False) -> None:
-    # printer.print(f"bwd pass in the whole")
     loss.backward()
-    # printer.print(f"grad of last layer v.proj: {model.base_model.        \
-    #                                             model.model.layers[-1].  \
-    #                                             self_attn.v_proj.lora_B. \
-    #                                             default.weight.grad}")
 
 def run_whole_peft_step(model: torch.nn.Module,
                         optimizer: torch.optim.Optimizer,
@@ -92,12 +83,7 @@ def run_whole_peft_holistic(model: torch.nn.Module,
                             total_timings: List[float] = [],
                             ) -> None:
     valid_step: int = 0
-    # num_chunks: int = seq_len // chunk_size
-    # len_thresh: int = chunk_size * (num_chunks-1)
     for step, inputs in tqdm(dataloader_iter):
-        # skip not-long-enough samples to ensure the full chunk number
-        # if inputs.input_ids.shape[1] <= len_thresh:
-        #     continue
         run_whole_peft_step(model, optimizer, valid_step, inputs,
                             do_backward=do_backward,
                             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -115,6 +101,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", "-m", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="model name or path")
     parser.add_argument("--dataset_name", type=str, default="yahma/alpaca-cleaned", help="dataset name or path")
+    parser.add_argument("--warmup", type=int, default=0,  help="Number of warmup peft iterations for benchmarking")
     parser.add_argument("--trials", type=int, default=5,  help="Number of peft iterations")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -135,7 +122,7 @@ if __name__ == "__main__":
     gc.collect()
 
     # fix random seed
-    fix_determinism(seed=args.seed)
+    fix_randomness_determinism(seed=args.seed, deterministic=False)
 
     # open printer
     printer.open() if args.print_out == "y" else printer.close()
@@ -155,13 +142,13 @@ if __name__ == "__main__":
     
     # create model
     model = create_chunk_model(model_name=args.model_name,
-                                pin_memory=bool(args.pin_memory),
-                                quant_bits=args.quant_bits,
-                                quant_group_size=args.quant_group_size,
-                                cache_dir=args.cache_dir,
-                                local_ranks=args.local_rank,
-                                dtype=get_dtype(args.dtype),
-                                attn_impl=args.attn_impl,)
+                               pin_memory=bool(args.pin_memory),
+                               quant_bits=args.quant_bits,
+                               quant_group_size=args.quant_group_size,
+                               cache_dir=args.cache_dir,
+                               local_rank=args.local_rank,
+                               dtype=get_dtype(args.dtype),
+                               attn_impl=args.attn_impl,)
     # create optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
@@ -180,9 +167,11 @@ if __name__ == "__main__":
                             total_timings=total_timings)
     
     # get results
+    assert args.warmup < args.trials, "warm-up steps should be smaller than total steps..."
     log_str: str = get_stat_str(model_name=args.model_name,
                                 cache_dir=args.cache_dir,
                                 batch_size=args.batch_size,
+                                warmup_steps=args.warmup,
                                 forward_timings=forward_timings,
                                 total_timings=total_timings,)
     fname: str = f"whole_{args.dtype}_seqlen{args.seq_len}_trials{args.trials}.txt"

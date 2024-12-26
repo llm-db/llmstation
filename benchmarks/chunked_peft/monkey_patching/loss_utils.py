@@ -9,7 +9,9 @@ def ForCausalLMLoss(
 ):
     # Upcast to float if we need to compute the loss to avoid potential precision issues
     
-    # FIXME: [higher precision for correctness check] float32 -> orig dtype [float64 in verification]
+    # NOTE: [chunked fine-tuning, higher precision for correctness check] 
+    #       float32 -> orig dtype [float64 in verification]
+    #       only FT in a whole will call this function
     # logits = logits.float()
     
     # Shift so that tokens < n predict n

@@ -2,7 +2,7 @@ import os
 import random
 import inspect
 from collections import OrderedDict
-from typing import List, Dict, Tuple, Union, Optional
+from typing import List, Dict, Union, Optional
 
 import torch
 import numpy as np
@@ -33,6 +33,80 @@ if is_flash_attn_2_available():
     flash_241 = is_flash_attn_greater_or_equal("2.4.1")
     deterministic_g = os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
 
+if torch.__version__ >= "2.5.0":
+    from torch.nn.attention.flex_attention import flex_attention
+    flex_attention_compiled = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+
+
+### Flex Attention
+
+def create_chunk_block_mask(
+    num_processed_tokens: int,
+    num_total_tokens: int,
+    chunk_size: int,    
+):
+    start_pos: int = num_processed_tokens
+    q_len = min(chunk_size, num_total_tokens-num_processed_tokens)
+    end_pos: int = q_len + num_processed_tokens
+    def causal(b, h, q_idx, kv_idx):
+        return q_idx+start_pos >= kv_idx
+    
+    from torch.nn.attention.flex_attention import create_block_mask
+    block_mask = create_block_mask(causal, B=None, H=None, Q_LEN=q_len, KV_LEN=end_pos, BLOCK_SIZE=(128, 128), _compile=True)
+    return block_mask
+
+class ChunkAttnIdentity(torch.autograd.Function):
+    @staticmethod
+    def forward(key_or_value, is_key=True, start_pos=0, end_pos=-1, layer_idx=-1, past_kv_grads=None):
+        output_key_or_value = key_or_value * 1.0
+        return output_key_or_value
+    
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        key_or_value, is_key, start_pos, end_pos, layer_idx, past_kv_grads = inputs
+        ctx.is_key = is_key
+        ctx.layer_idx = layer_idx
+        ctx.start_pos = start_pos
+        ctx.end_pos = end_pos
+        ctx.past_kv_grads = past_kv_grads
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_key_or_value = grad_output
+
+        start_pos: int = ctx.start_pos
+        end_pos: int = ctx.end_pos
+        layer_idx: int = ctx.layer_idx
+        past_kv_grads: ChunkCache = ctx.past_kv_grads
+        is_key: bool = ctx.is_key
+
+        if is_key:
+            grad_key_or_value = past_kv_grads.update_key_grads(grad_key_or_value, start_pos, end_pos, layer_idx)
+        else:
+            grad_key_or_value = past_kv_grads.update_value_grads(grad_key_or_value, start_pos, end_pos, layer_idx)
+        
+        return grad_key_or_value, None, None, None, None, None
+
+
+def chunk_attn_identity(
+    key_or_value,
+    is_key,
+    start_pos,
+    end_pos,
+    layer_idx,
+    past_kv_grads
+):
+    return ChunkAttnIdentity.apply(
+        key_or_value,
+        is_key,
+        start_pos,
+        end_pos,
+        layer_idx,
+        past_kv_grads
+    )
+
+
+### Chunked FlashAttention
 
 class ChunkFlashAttnFunc(torch.autograd.Function):
     @staticmethod
@@ -180,7 +254,8 @@ def _chunk_flash_attention_forward(
     start_pos: int = 0, end_pos: int = -1, layer_idx: int = -1, past_kv_grads: "ChunkCache" = None,
 ):
     """
-    Modified from HuggingFace transformers v4.47.0 src/transformers/modeling_flash_attention_utils.py _flash_attention_forward
+    Modified from HuggingFace transformers v4.47.0 src/transformers/modeling_flash_attention_utils.py _flash_attention_forward.
+    For Chunked Fine-tuning, we only use `flash_attn_func`.
     """
     if not use_top_left_mask:
         causal = is_causal
@@ -270,62 +345,96 @@ def _chunk_flash_attention_forward(
 
     else:
         attn_output = chunk_flash_attn_func(
-            query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal, 
+            query_states, key_states, value_states, 
+            dropout, softmax_scale=softmax_scale, causal=causal, 
             start_pos=start_pos, end_pos=end_pos, layer_idx=layer_idx, past_kv_grads=past_kv_grads, **flash_kwargs
         )
 
     return attn_output
 
 
+### Chunked SDPA
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    Copied from https://github.com/huggingface/transformers/blob/v4.47.0/src/transformers/models/llama/modeling_llama.py
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
 
 class ChunkSDPA(torch.autograd.Function):
     @staticmethod
     def forward(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, 
-                start_pos=0, end_pos=-1, layer_idx=-1, past_kv_grads=None):
+                start_pos=0, end_pos=-1, layer_idx=-1, past_kv_grads=None, num_key_value_groups=1):
         output = torch.nn.functional.scaled_dot_product_attention(query, key, value, attn_mask, dropout_p, is_causal)
         return output
     
     @staticmethod
     def setup_context(ctx, inputs, output):
-        query, key, value, attn_mask, dropout_p, is_causal, start_pos, end_pos, layer_idx, past_kv_grads = inputs
-        ctx.save_for_backward(query, key, value, attn_mask)
+        (
+            query, 
+            key, 
+            value, 
+            attn_mask, 
+            dropout_p, 
+            is_causal, 
+            start_pos, end_pos, layer_idx, past_kv_grads, num_key_value_groups
+        ) = inputs
+
+        ctx.save_for_backward(query, attn_mask)
         ctx.dropout_p = dropout_p
         ctx.is_causal = is_causal
         ctx.layer_idx = layer_idx
         ctx.start_pos = start_pos
-        ctx.end_pos = end_pos
+        ctx.end_pos   = end_pos
         ctx.past_kv_grads = past_kv_grads
+        ctx.num_key_value_groups = num_key_value_groups
     
     @staticmethod
     def backward(ctx, grad_output):
         # read range start & range end
         start_pos: int = ctx.start_pos
-        end_pos: int = ctx.end_pos
-        # read layer idx
+        end_pos:   int = ctx.end_pos
         layer_idx: int = ctx.layer_idx
-        
-        # print(f"start: {start_pos}; end: {end_pos}; layer_idx: {layer_idx}")
+        num_key_value_groups: int = ctx.num_key_value_groups
         
         # add grad back to cache
         past_kv_grads: ChunkCache = ctx.past_kv_grads
 
-        query, key, value, attn_mask = ctx.saved_tensors
+        query, attn_mask = ctx.saved_tensors
+        
+        key = past_kv_grads.key_cache[layer_idx]
+        value = past_kv_grads.value_cache[layer_idx]
+
+        key   = repeat_kv(key,   num_key_value_groups)[:,:,:end_pos,:].requires_grad_().contiguous()
+        value = repeat_kv(value, num_key_value_groups)[:,:,:end_pos,:].requires_grad_().contiguous()
+
         dropout_p = ctx.dropout_p
         is_causal = ctx.is_causal
         
         # compute grads manually
         grad_query = grad_key = grad_value = None
-        
-        # dQ, dK, dV (here assumes torch handles it)
         if query.requires_grad or key.requires_grad or value.requires_grad:
             with torch.enable_grad():
                 query = query.detach().requires_grad_()
-                key = key.detach().requires_grad_()
+                key   = key.detach().requires_grad_()
                 value = value.detach().requires_grad_()
                 
                 # recompute output for gradient calculation
-                # FIXME: consider use ctx to save outputs to avoid re-computation
-                output = torch.nn.functional.scaled_dot_product_attention(query, key, value, attn_mask, dropout_p, is_causal)
+                output = torch.nn.functional.scaled_dot_product_attention(
+                    query, 
+                    key, 
+                    value, 
+                    attn_mask, 
+                    dropout_p, 
+                    is_causal
+                )
                 
                 # torch.autograd.grad to compute gradients
                 grads = torch.autograd.grad(outputs=output, 
@@ -334,10 +443,10 @@ class ChunkSDPA(torch.autograd.Function):
                                             allow_unused=True)
                 grad_query, grad_key, grad_value = grads
 
-                # return corresponding range of gradients
+                # update prev range grads & return current range of grads
                 grad_key, grad_value = past_kv_grads.update_grads(grad_key, grad_value, start_pos, end_pos, layer_idx)
 
-        return grad_query, grad_key, grad_value, None, None, None, None, None, None, None
+        return grad_query, grad_key, grad_value, None, None, None, None, None, None, None, None
 
 
 def chunk_sdpa(query_states: torch.Tensor,
@@ -349,7 +458,8 @@ def chunk_sdpa(query_states: torch.Tensor,
                start_pos: int,
                end_pos: int,
                layer_idx: int,
-               past_kv_grads: "ChunkCache"):
+               past_kv_grads: "ChunkCache",
+               num_key_value_groups: int = 1):
     return ChunkSDPA.apply(
         query_states, 
         key_states, 
@@ -361,28 +471,43 @@ def chunk_sdpa(query_states: torch.Tensor,
         end_pos,
         layer_idx,
         past_kv_grads,
+        num_key_value_groups,
     )
 
+### Chunk Cache w/ K, V & dK, dV
 
 class ChunkCache(DynamicCache):
     def __init__(self, attn_impl: str = "flash_attention_2") -> None:
         super().__init__()
-        self.key_grads_cache = []
+        self.key_grads_cache   = []
         self.value_grads_cache = []
         self.max_layer_idx = None
         self.attn_impl = attn_impl
-    
+        self.block_mask = None # for Flex Attention
+
     def detach_kv_cache(self):
-        new_key_cache = []
+        new_key_cache   = []
         new_value_cache = []
         for key_tensor in self.key_cache:
-            new_key_cache.append(key_tensor.detach().to(device=key_tensor.device).requires_grad_())
+            new_key_cache.append(key_tensor.detach().to(device=key_tensor.device))
         for value_tensor in self.value_cache:
-            new_value_cache.append(value_tensor.detach().to(device=value_tensor.device).requires_grad_())
+            new_value_cache.append(value_tensor.detach().to(device=value_tensor.device))
+        del self.key_cache
+        del self.value_cache
         self.key_cache = new_key_cache
         self.value_cache = new_value_cache
 
-    def update_grads(self, key_grad, value_grad, start_pos, end_pos, layer_idx):
+    def reset(self):
+        del self.key_cache
+        del self.value_cache
+        del self.key_grads_cache
+        del self.value_grads_cache
+        self.key_cache   = []
+        self.value_cache = []
+        self.key_grads_cache   = []
+        self.value_grads_cache = []
+
+    def update_key_grads(self, key_grad, start_pos, end_pos, layer_idx):
         # update max layer idx
         if self.max_layer_idx is None:
             self.max_layer_idx = layer_idx
@@ -390,39 +515,83 @@ class ChunkCache(DynamicCache):
         # update the cache
         cur_layer_idx: int = self.max_layer_idx - layer_idx
 
-        # print(f"cur_layer_idx: {cur_layer_idx}; len(key_grads_cache): {len(self.key_grads_cache)}")
+        valid_key_grads = None
+        update_key_grads = []
+        if key_grad is not None:
+            key_grad = key_grad.detach()
+            valid_key_grads  = key_grad[:,start_pos:end_pos,:,:] if self.attn_impl == "flash_attention_2" \
+                          else key_grad[:,:,start_pos:end_pos,:]
+            update_key_grads = key_grad[:,:start_pos,:,:] if self.attn_impl == "flash_attention_2" \
+                          else key_grad[:,:,:start_pos,:]
 
         if len(self.key_grads_cache) <= cur_layer_idx:
             # there may be skipped layers, fill them with empty lists
             for _ in range(len(self.key_grads_cache), cur_layer_idx):
                 self.key_grads_cache.append([])
-                self.value_grads_cache.append([])
-            self.key_grads_cache.append(key_grad.detach())
-            self.value_grads_cache.append(value_grad.detach())
+            self.key_grads_cache.append(update_key_grads)
         elif len(self.key_grads_cache[cur_layer_idx]) == 0:  # fills previously skipped layers; checking for tensor causes errors
-            self.key_grads_cache[cur_layer_idx] = key_grad.detach()
-            self.value_grads_cache[cur_layer_idx] = value_grad.detach()
+            self.key_grads_cache[cur_layer_idx] = update_key_grads
         else:
-            # print(f"key_grads_cache[{cur_layer_idx}]: {self.key_grads_cache[cur_layer_idx].shape}")
-            # print(f"key_grad: {key_grad.shape}")
-            if self.attn_impl == "flash_attention_2":
-                self.key_grads_cache[cur_layer_idx] = self.key_grads_cache[cur_layer_idx][:,:end_pos,:,:] + key_grad.detach()
-                self.value_grads_cache[cur_layer_idx] = self.value_grads_cache[cur_layer_idx][:,:end_pos,:,:] + value_grad.detach()
+            if key_grad is not None:
+                accum_key_grads = self.key_grads_cache[cur_layer_idx][:,:start_pos,:,:] if self.attn_impl == "flash_attention_2" \
+                             else self.key_grads_cache[cur_layer_idx][:,:,:start_pos,:]
+                accum_valid_key_grads = self.key_grads_cache[cur_layer_idx][:,start_pos:end_pos,:,:] if self.attn_impl == "flash_attention_2" \
+                                   else self.key_grads_cache[cur_layer_idx][:,:,start_pos:end_pos,:]
+                valid_key_grads += accum_valid_key_grads
+                self.key_grads_cache[cur_layer_idx] = accum_key_grads + update_key_grads
             else:
-                self.key_grads_cache[cur_layer_idx] = self.key_grads_cache[cur_layer_idx][:,:,:end_pos,:] + key_grad.detach()
-                self.value_grads_cache[cur_layer_idx] = self.value_grads_cache[cur_layer_idx][:,:,:end_pos,:] + value_grad.detach()
+                self.key_grads_cache[cur_layer_idx] = []
         
-        if self.attn_impl == "flash_attention_2":
-            valid_key_grads = torch.cat([torch.zeros_like(self.key_grads_cache[cur_layer_idx])[:,:start_pos,:,:], 
-                                        self.key_grads_cache[cur_layer_idx][:,start_pos:end_pos:,:,:]], dim=1)
-            valid_value_grads = torch.cat([torch.zeros_like(self.value_grads_cache[cur_layer_idx])[:,:start_pos,:,:], 
-                                          self.value_grads_cache[cur_layer_idx][:,start_pos:end_pos:,:,:]], dim=1)
+        if key_grad is not None:
+            padding_zeros = torch.zeros_like(key_grad[:,:start_pos,:,:] if self.attn_impl == "flash_attention_2" \
+                                        else key_grad[:,:,:start_pos,:])
+            valid_key_grads = torch.cat([padding_zeros, valid_key_grads], dim=(1 if self.attn_impl == "flash_attention_2" else 2))
+        return valid_key_grads
+        
+    def update_value_grads(self, value_grad, start_pos, end_pos, layer_idx):
+        # update max layer idx
+        if self.max_layer_idx is None:
+            self.max_layer_idx = layer_idx
+
+        # update the cache
+        cur_layer_idx: int = self.max_layer_idx - layer_idx
+
+        valid_value_grads = None
+        update_value_grads = []
+        if value_grad is not None:
+            value_grad = value_grad.detach()
+            valid_value_grads  = value_grad[:,start_pos:end_pos,:,:] if self.attn_impl == "flash_attention_2" \
+                            else value_grad[:,:,start_pos:end_pos,:]
+            update_value_grads = value_grad[:,:start_pos,:,:] if self.attn_impl == "flash_attention_2" \
+                            else value_grad[:,:,:start_pos,:]
+
+        if len(self.value_grads_cache) <= cur_layer_idx:
+            # there may be skipped layers, fill them with empty lists
+            for _ in range(len(self.value_grads_cache), cur_layer_idx):
+                self.value_grads_cache.append([])
+            self.value_grads_cache.append(update_value_grads)
+        elif len(self.value_grads_cache[cur_layer_idx]) == 0:  # fills previously skipped layers; checking for tensor causes errors
+            self.value_grads_cache[cur_layer_idx] = update_value_grads
         else:
-            valid_key_grads = torch.cat([torch.zeros_like(self.key_grads_cache[cur_layer_idx])[:,:,:start_pos,:], 
-                                        self.key_grads_cache[cur_layer_idx][:,:,start_pos:end_pos:,:]], dim=-2)
-            valid_value_grads = torch.cat([torch.zeros_like(self.value_grads_cache[cur_layer_idx])[:,:,:start_pos,:], 
-                                        self.value_grads_cache[cur_layer_idx][:,:,start_pos:end_pos:,:]], dim=-2)
-        # print(f"cur_layer_idx: {cur_layer_idx}; len(key_grads_cache): {len(self.key_grads_cache)}")
+            if value_grad is not None:
+                accum_value_grads = self.value_grads_cache[cur_layer_idx][:,:start_pos,:,:] if self.attn_impl == "flash_attention_2" \
+                               else self.value_grads_cache[cur_layer_idx][:,:,:start_pos,:]
+                accum_valid_value_grads = self.value_grads_cache[cur_layer_idx][:,start_pos:end_pos,:,:] if self.attn_impl == "flash_attention_2" \
+                                     else self.value_grads_cache[cur_layer_idx][:,:,start_pos:end_pos,:]
+                valid_value_grads += accum_valid_value_grads
+                self.value_grads_cache[cur_layer_idx] = accum_value_grads + update_value_grads
+            else:
+                self.value_grads_cache[cur_layer_idx] = []
+        if value_grad is not None:
+            padding_zeros = torch.zeros_like(value_grad[:,:start_pos,:,:] if self.attn_impl == "flash_attention_2" \
+                                        else value_grad[:,:,:start_pos,:])
+            valid_value_grads = torch.cat([padding_zeros, valid_value_grads], dim=(1 if self.attn_impl == "flash_attention_2" else 2))
+        
+        return valid_value_grads
+
+    def update_grads(self, key_grad, value_grad, start_pos, end_pos, layer_idx):
+        valid_key_grads   = self.update_key_grads(key_grad, start_pos, end_pos, layer_idx)
+        valid_value_grads = self.update_value_grads(value_grad, start_pos, end_pos, layer_idx)
         return valid_key_grads, valid_value_grads
 
 
@@ -445,15 +614,19 @@ printer = Printer()
 
 INVALID_TARGET: int = -100
 
-def fix_determinism(seed: int = 42) -> None:
+def fix_randomness_determinism(seed: int = 42, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True)
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True)
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
 def fixed_cross_entropy(source, target, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs):
     reduction = "sum" if num_items_in_batch is not None else "mean"
@@ -475,25 +648,26 @@ def get_hf_model(
     lora_dropout: float = 0.0,
     target_modules: List[str] = ["q_proj", "v_proj"],
 ) -> torch.nn.Module:
-    # FIXME: for numerical verification based on float64 compatible math sdp
     torch.backends.cuda.enable_math_sdp(enabled=False)
     torch.backends.cuda.enable_flash_sdp(enabled=False)
     torch.backends.cuda.enable_mem_efficient_sdp(enabled=False)
+    if torch.__version__ >= "2.5.0":
+        torch.backends.cuda.enable_cudnn_sdp(enabled=False)
+    
     if attn_impl == "math":
         torch.backends.cuda.enable_math_sdp(enabled=True)
     elif attn_impl == "mem_efficient":
         torch.backends.cuda.enable_mem_efficient_sdp(enabled=True)
     elif attn_impl == "flash":
-        print(f"im here")
         torch.backends.cuda.enable_flash_sdp(enabled=True)
+    elif attn_impl == "cudnn" and torch.__version__ >= "2.5.0":
+        torch.backends.cuda.enable_cudnn_sdp(enabled=True)
 
     config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
-    if attn_impl in ["math", "flash", "mem_efficient"]:
+    if attn_impl in ["math", "flash", "mem_efficient", "cudnn"]:
         config._attn_implementation = "sdpa"
     else:
         config._attn_implementation = attn_impl
-    
-    # config.num_hidden_layers = 4 # FIXME: for visualization
     
     pin_memory = bool(pin_memory)
     if quant_bits == 4:
@@ -530,42 +704,34 @@ def create_chunk_model(model_name: str,
                        quant_bits: int,
                        quant_group_size: int,
                        cache_dir: str,
-                       local_ranks: Union[int, List[int]] = 0,
+                       local_rank: int = 0,
                        dtype: torch.dtype = torch.bfloat16,
-                       attn_impl: str = "flash_attn",
+                       attn_impl: str = "mem_efficient",
                        lora_r: int = 64,
                        lora_alpha: int = 32,
                        lora_dropout: float = 0.0,
                        target_modules: List[str] = ["q_proj", "v_proj"],
-                       ) -> Union[torch.nn.Module, List[torch.nn.Module]]:
-    if not isinstance(local_ranks, list):
-        local_ranks: List[int] = [ local_ranks ]
-    assert len(local_ranks) > 0
-    models: List[torch.nn.Module] = []
-    for idx, local_rank in enumerate(local_ranks):
-        torch.cuda.set_device(local_rank)
-        printer.print(f"loading model {idx}...")
-        # for comparison, always set the first model as eager impl [whole fwd & bwd]
-        cur_attn_impl: str = "eager" if len(local_ranks) > 1 and idx == 0 else attn_impl
-        model: torch.nn.Module = get_hf_model(
-            model_name,
-            pin_memory,
-            quant_bits,
-            quant_group_size,
-            cache_dir,
-            dtype=dtype,
-            attn_impl=cur_attn_impl,
-            lora_r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            target_modules=target_modules,
-        )
-        if (idx > 0):
-            copy_models(models[0], model)
-            check_two_same_models(models[0], model)
-        models.append(model)
-    torch.cuda.set_device(local_ranks[0])
-    return models[0] if len(models) == 1 else models
+                       ) -> torch.nn.Module:
+    torch.cuda.set_device(local_rank)
+    printer.print(f"loading model...")
+    # for comparison, always set the first model as eager impl [whole fwd & bwd]
+    # cur_attn_impl: str = "eager" if len(local_ranks) > 1 and idx == 0 else attn_impl
+    model: torch.nn.Module = get_hf_model(
+        model_name,
+        pin_memory,
+        quant_bits,
+        quant_group_size,
+        cache_dir,
+        dtype=dtype,
+        attn_impl=attn_impl,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=target_modules,
+    )
+    
+    torch.cuda.set_device(local_rank)
+    return model
 
 def get_learnable_param_grad(model: torch.nn.Module) -> OrderedDict:
     res_dict = OrderedDict()
@@ -583,16 +749,16 @@ def copy_input(inputs: Union[List[int], Dict], local_rank: int) -> Union[List[in
     return new_inputs
 
 def get_dtype(dtype_str: str) -> torch.dtype:
-    if dtype_str == "fp16":
-        return torch.float16
-    elif dtype_str == "bf16":
-        return torch.bfloat16
-    elif dtype_str == "fp32":
-        return torch.float32
-    elif dtype_str == "fp64":
-        return torch.float64
-    else:
+    STR_TO_DTYPE: Dict = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+        "fp64": torch.float64
+    }
+    target_dtype: Union[torch.dtype, None] = STR_TO_DTYPE.get(dtype_str, None)
+    if target_dtype is None:
         raise NotImplementedError()
+    return target_dtype
 
 def add_print_backward_hooks(model: torch.nn.Module):
     def backward_hook_fn(module: torch.nn.Module, 

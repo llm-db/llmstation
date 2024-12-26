@@ -2,8 +2,7 @@ import os
 import gc
 import argparse
 import itertools
-from collections import OrderedDict
-from typing import List, Dict, Tuple, Union, Optional
+from typing import List, Dict, Tuple, Union
 
 import torch
 from tqdm import tqdm
@@ -19,7 +18,7 @@ from benchmarks.chunked_peft.chunk_utils import (
     ChunkCache,
     printer,
     INVALID_TARGET,
-    fix_determinism,
+    fix_randomness_determinism,
     fixed_cross_entropy,
     create_chunk_model,
     get_dtype,
@@ -29,7 +28,7 @@ from benchmarks.chunked_peft.timer_utils import (
     get_stat_str,
 )
 
-from benchmarks.chunked_peft.monkey_patching.monkey_patching import open_performance_mode
+from benchmarks.chunked_peft.monkey_patching import open_performance_mode
 
 def chunked_peft_forward_naive(model: torch.nn.Module, 
                                inputs: Union[List[int], Dict],
@@ -42,7 +41,7 @@ def chunked_peft_forward_naive(model: torch.nn.Module,
     num_valid_tokens: torch.Tensor = (inputs.labels != INVALID_TARGET).sum(dim=-1, keepdim=True)\
                                                                       .to(device=torch.cuda.current_device()) - 1
     losses: List[torch.nn.Module] = []
-    # logits: List[torch.Tensor] = []
+    
     while num_processed_tokens < num_total_tokens:
         num_cur_step: int = min(chunk_size, 
                                 num_total_tokens-num_processed_tokens)
@@ -59,8 +58,6 @@ def chunked_peft_forward_naive(model: torch.nn.Module,
                             "use_cache": True,
                             }
         
-        # TODO: check grad ckpt's implications on performance
-        # model.gradient_checkpointing_enable(dict(use_reentrant=False))
         outputs = model(**cur_inputs)
 
         cur_logits: torch.Tensor = outputs.logits.float()
@@ -79,14 +76,10 @@ def chunked_peft_forward_naive(model: torch.nn.Module,
         shift_targets = shift_targets.to(shift_logits.device)
         cur_loss = fixed_cross_entropy(shift_logits, shift_targets, 1, INVALID_TARGET)
         
-        # cur_loss: torch.Tensor = (loss_fn(shift_logits.permute(0, 2, 1), 
-        #                                   shift_targets)).sum(dim=-1, keepdim=True)
         cur_loss /= num_valid_tokens.item() # sum of avg-token-loss in current chunk
         losses.append(cur_loss)
-        # logits.append(outputs.logits)
         num_processed_tokens += num_cur_step
 
-    # whole_logits = torch.cat(logits, dim=1)   
     return losses, None
 
 
@@ -102,7 +95,6 @@ def chunked_peft_forward_separate(model: torch.nn.Module,
     num_valid_tokens: torch.Tensor = (inputs.labels != INVALID_TARGET).sum(dim=-1, keepdim=True)\
                                                                       .to(device=torch.cuda.current_device()) - 1
     losses: List[torch.nn.Module] = []
-    # logits: List[torch.Tensor] = []
     
     elapsed_times: List[float] = [ ]
     if start_event is not None:
@@ -112,7 +104,6 @@ def chunked_peft_forward_separate(model: torch.nn.Module,
         prev_elapsed_time: float = start_event.elapsed_time(init_event) / 1000
     
     while num_processed_tokens < num_total_tokens:
-        
         if start_event is not None:
             cur_event = torch.cuda.Event(enable_timing=True)
         
@@ -130,16 +121,13 @@ def chunked_peft_forward_separate(model: torch.nn.Module,
                             "use_cache": True,
                             }
         
-        # TODO: Check grad ckpt's implications on performance
-        # model.gradient_checkpointing_enable(dict(use_reentrant=False))
+        
         outputs = model(**cur_inputs)
-
-        # print(f"right after a model call, len of key_grads_cache: {len(outputs.past_key_values.key_grads_cache)}")
 
         # NOTE: detach prev tensor from the computation graph of new chunks
         past_key_values: ChunkCache = outputs.past_key_values
         past_key_values.detach_kv_cache()
-
+        
         cur_logits: torch.Tensor = outputs.logits
         
         # (batch size, len, class) -> (batch size, class, len) -> (batch size, len) -> (batch size, 1)
@@ -152,18 +140,15 @@ def chunked_peft_forward_separate(model: torch.nn.Module,
             shift_targets: torch.Tensor = inputs.labels[:, num_processed_tokens+1: num_will_complete_tokens] \
                                                 .to(device=torch.cuda.current_device())
         
-        # NOTE: here we only consider batch_size = 1
-        # TODO: extend to batch_size > 1
+        # NOTE: here we only consider batch_size = 1, as for FT-serving purpose
+        #       a smaller batch (i.e., 1) rather than smaller chunks should be the first to consider
         shift_targets = shift_targets.view(-1)
         shift_logits  = shift_logits.view(-1, shift_logits.shape[-1])
         shift_targets = shift_targets.to(shift_logits.device)
         cur_loss = fixed_cross_entropy(shift_logits, shift_targets, 1, INVALID_TARGET)
         
-        # cur_loss: torch.Tensor = (loss_fn(shift_logits.permute(0, 2, 1), 
-        #                                   shift_targets)).sum(dim=-1, keepdim=True)
         cur_loss /= num_valid_tokens.item() # sum of avg-token-loss in current chunk
         losses.append(cur_loss)
-        # logits.append(outputs.logits)
         num_processed_tokens += num_cur_step
 
         if start_event is not None:
@@ -173,7 +158,6 @@ def chunked_peft_forward_separate(model: torch.nn.Module,
             elapsed_times.append(cur_elapsed_time - prev_elapsed_time)
             prev_elapsed_time = cur_elapsed_time
 
-    # whole_logits = torch.cat(logits, dim=1)   
     return losses, None, elapsed_times
 
 
@@ -183,20 +167,17 @@ def chunked_peft_backward(model: torch.nn.Module,
                           start_event: torch.cuda.Event = None,
                           end_forward_event: torch.cuda.Event = None,
                           ) -> List[float]:
-    # printer.print(f"bwd pass in backward chunk order")
     n: int = len(losses)
 
     elapsed_times: List[float] = [ ]
     if start_event is not None:
         prev_elapsed_time: float = start_event.elapsed_time(end_forward_event) / 1000
     
-    for idx, loss in enumerate(losses[::-1]):
-        # printer.print(f"bwd pass w. chunk: {n-idx-1}")
-
+    for loss in losses[::-1]:
         if start_event is not None:
             cur_event = torch.cuda.Event(enable_timing=True)
 
-        loss.backward(retain_graph=(False if idx == n-1 else True))
+        loss.backward(retain_graph=True)
 
         if start_event is not None:
             cur_event.record()
@@ -205,36 +186,22 @@ def chunked_peft_backward(model: torch.nn.Module,
             elapsed_times.append(cur_elapsed_time - prev_elapsed_time)
             prev_elapsed_time = cur_elapsed_time
 
-        # printer.print(f"grad of last layer v.proj: {model.base_model.        \
-        #                                             model.model.layers[-1].  \
-        #                                             self_attn.v_proj.lora_B. \
-        #                                             default.weight.grad}")
     return elapsed_times
 
 
 def chunked_peft_backward_whole(model: torch.nn.Module,
                                 losses: List[torch.nn.Module],
                                 check_grad: bool = False) -> None:
-    # printer.print(f"bwd pass w. whole loss")
     loss = sum(losses)
     loss.backward()
-    # printer.print(f"grad of last layer v.proj: {model.base_model.        \
-    #                                             model.model.layers[-1].  \
-    #                                             self_attn.v_proj.lora_B. \
-    #                                             default.weight.grad}")
 
 def chunked_peft_backward_forward_order(model: torch.nn.Module,
                                         losses: List[torch.nn.Module],
                                         check_grad: bool = False) -> None:
-    # printer.print(f"bwd pass in forward chunk order")
+    """ Only work for naive chunk. For separate chunk, cache update logic needs to be changed """
     n: int = len(losses)
     for idx, loss in enumerate(losses):
-        # printer.print(f"bwd pass w. chunk: {idx} (forward chunk order)")
         loss.backward(retain_graph=(False if idx == n-1 else True))
-        # printer.print(f"grad of last layer v.proj: {model.base_model.        \
-        #                                             model.model.layers[-1].  \
-        #                                             self_attn.v_proj.lora_B. \
-        #                                             default.weight.grad}")
 
 def run_chunked_peft_step(model: torch.nn.Module,
                           optimizer: torch.optim.Optimizer,
@@ -251,6 +218,8 @@ def run_chunked_peft_step(model: torch.nn.Module,
                           forward_timings: List[float] = [],
                           total_timings: List[float] = [],
                           show_chunk_time: str = "n",
+                          fwd_chunk_timings: List[List[float]] = [],
+                          bwd_chunk_timings: List[List[float]] = [],
                           ) -> None:
     torch.cuda.set_device(local_rank)
 
@@ -291,12 +260,10 @@ def run_chunked_peft_step(model: torch.nn.Module,
         if step % gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
-    
+
     end_event.record()
     torch.cuda.synchronize()
     total_timings.append(start_event.elapsed_time(end_event) / 1000.0)
-
-    del losses
 
     if show_chunk_time == "y" and per_chunk_fwd_timings is not None:
         num_chunks: int = len(per_chunk_fwd_timings)
@@ -307,6 +274,10 @@ def run_chunked_peft_step(model: torch.nn.Module,
         num_chunks: int = len(per_chunk_bwd_timings)
         for idx, elapsed_time in enumerate(per_chunk_bwd_timings):
             print(f"bwd time of {num_chunks-idx-1}-th chunk: {elapsed_time}")
+    
+    if show_chunk_time == "y":
+        fwd_chunk_timings.append(per_chunk_fwd_timings)
+        bwd_chunk_timings.append(per_chunk_bwd_timings)
 
 
 def run_chunked_peft_holistic(model: torch.nn.Module, 
@@ -325,14 +296,11 @@ def run_chunked_peft_holistic(model: torch.nn.Module,
                               forward_timings: List[float] = [],
                               total_timings: List[float] = [],
                               show_chunk_time: str = "n",
+                              fwd_chunk_timings: List[List[float]] = [],
+                              bwd_chunk_timings: List[List[float]] = [],
                               ) -> None:
     valid_step: int = 0
-    # num_chunks: int = seq_len // chunk_size
-    # len_thresh: int = chunk_size * (num_chunks-1)
     for step, inputs in tqdm(dataloader_iter):
-        # skip not-long-enough samples to ensure the full chunk number
-        # if inputs.input_ids.shape[1] <= len_thresh:
-        #     continue
         run_chunked_peft_step(model, optimizer, valid_step, inputs,
                               do_backward=do_backward,
                               gradient_accumulation_steps=gradient_accumulation_steps,
@@ -344,7 +312,9 @@ def run_chunked_peft_holistic(model: torch.nn.Module,
                               backward_order=backward_order,
                               forward_timings=forward_timings,
                               total_timings=total_timings,
-                              show_chunk_time=show_chunk_time)
+                              show_chunk_time=show_chunk_time,
+                              fwd_chunk_timings=fwd_chunk_timings,
+                              bwd_chunk_timings=bwd_chunk_timings,)
         # check break cond
         valid_step += 1
         if valid_step >= num_run_steps:
@@ -354,6 +324,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", "-m", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="model name or path")
     parser.add_argument("--dataset_name", type=str, default="yahma/alpaca-cleaned", help="dataset name or path")
+    parser.add_argument("--warmup", type=int, default=0,  help="Number of warmup peft iterations for benchmarking")
     parser.add_argument("--trials", type=int, default=5,  help="Number of peft iterations")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -365,7 +336,7 @@ if __name__ == "__main__":
     parser.add_argument("--quant_group_size", type=int, default=64, help="model weight quantization group size")
     parser.add_argument("--cache_dir", type=str, default=".", help="cache dir for model name")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16", "fp32", "fp64"])
-    parser.add_argument("--attn_impl", type=str, default="flash_attention_2", choices=["eager", "flash_attention_2", "math", "mem_efficient"], help="torch attention implementation")
+    parser.add_argument("--attn_impl", type=str, default="flash_attention_2", choices=["eager", "flash_attention_2", "math", "mem_efficient", "cudnn"], help="torch attention implementation")
     parser.add_argument("--chunk_impl", type=str, default="separate", choices=["naive", "separate"], help="chunked BWD implementation")
     parser.add_argument("--seed", type=int, default=42, help="random seed")
     parser.add_argument("--res_folder", type=str, default=".", help="path to store benchmarking results")
@@ -376,7 +347,7 @@ if __name__ == "__main__":
     gc.collect()
 
     # fix random seed
-    fix_determinism(seed=args.seed)
+    fix_randomness_determinism(seed=args.seed, deterministic=False)
 
     # open printer
     printer.open() if args.print_out == "y" else printer.close()
@@ -387,8 +358,10 @@ if __name__ == "__main__":
     open_performance_mode()
 
     # timer records
-    forward_timings: List[float] = []
-    total_timings:   List[float] = []
+    forward_timings:   List[float] = [ ]
+    total_timings:     List[float] = [ ]
+    fwd_chunk_timings: List[List[float]] = [ ]
+    bwd_chunk_timings: List[List[float]] = [ ]
 
     # create dataloader (iterate over the same data)
     dataloader_iter = load_data(model_name=args.model_name, 
@@ -405,9 +378,10 @@ if __name__ == "__main__":
                                quant_bits=args.quant_bits,
                                quant_group_size=args.quant_group_size,
                                cache_dir=args.cache_dir,
-                               local_ranks=args.local_rank,
+                               local_rank=args.local_rank,
                                dtype=get_dtype(args.dtype),
-                               attn_impl=args.attn_impl,)
+                               attn_impl=args.attn_impl,
+                               target_modules=["q_proj", "v_proj"])
     
     # create optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -428,13 +402,19 @@ if __name__ == "__main__":
                               backward_order=True,
                               forward_timings=forward_timings,
                               total_timings=total_timings,
-                              show_chunk_time=args.show_chunk_time,)
+                              show_chunk_time=args.show_chunk_time,
+                              fwd_chunk_timings=fwd_chunk_timings,
+                              bwd_chunk_timings=bwd_chunk_timings,)
     # get results
+    assert args.warmup < args.trials, "warm-up steps should be smaller than total steps..."
     log_str: str = get_stat_str(model_name=args.model_name,
                                 cache_dir=args.cache_dir,
                                 batch_size=args.batch_size,
+                                warmup_steps=args.warmup,
                                 forward_timings=forward_timings,
-                                total_timings=total_timings,)
+                                total_timings=total_timings,
+                                fwd_chunk_timings=fwd_chunk_timings,
+                                bwd_chunk_timings=bwd_chunk_timings,)
     fname: str = f"chunk_{args.dtype}_seqlen{args.seq_len}_chunksize{args.chunk_size}_trials{args.trials}.txt"
     with open(args.res_folder + "/" + fname, "a+") as fp:
         seed_str: str = f"[seed: {args.seed}]\n"

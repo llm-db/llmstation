@@ -14,9 +14,11 @@ from benchmarks.chunked_peft.data_utils import (
 
 from benchmarks.chunked_peft.chunk_utils import (
     printer,
-    fix_determinism,
+    fix_randomness_determinism,
     copy_input,
     create_chunk_model,
+    copy_models,
+    check_two_same_models,
     get_dtype,
 )
 
@@ -28,7 +30,7 @@ from benchmarks.chunked_peft.correctness.chunked_peft import (
     run_chunked_peft_step
 )
 
-from benchmarks.chunked_peft.monkey_patching.monkey_patching import open_correctness_mode
+from benchmarks.chunked_peft.monkey_patching import open_correctness_mode
 
 
 def check_results(res_tuple_1, res_tuple_2, tolerance: float = 1e-5, 
@@ -83,12 +85,7 @@ def run_and_check_results(models: Tuple[torch.nn.Module, torch.nn.Module],
                           ) -> List[Tuple[torch.tensor, torch.tensor, Optional[OrderedDict]]]:
     results: List[Tuple[torch.tensor, torch.tensor, Optional[OrderedDict]]] = []
     valid_step: int = 0
-    num_chunks: int = seq_len // chunk_size
-    len_thresh: int = chunk_size * (num_chunks-1)
     for step, inputs in tqdm(dataloader_iter):
-        # skip not-long-enough samples to ensure the full chunk number
-        if inputs.input_ids.shape[1] <= len_thresh:
-            continue
         # first: whole
         whole_inputs = copy_input(inputs, local_rank=local_ranks[0])
         whole_result = run_whole_peft_step(models[0], optimizers[0], valid_step, whole_inputs,
@@ -143,7 +140,7 @@ if __name__ == "__main__":
     gc.collect()
 
     # fix random seed
-    fix_determinism()
+    fix_randomness_determinism()
 
     # open printer
     printer.open() if args.print_out == "y" else printer.close()
@@ -161,14 +158,29 @@ if __name__ == "__main__":
                                 batch_size=1, 
                                 pin_memory=bool(args.pin_memory))
     # create model
-    models = create_chunk_model(model_name=args.model_name,
-                                pin_memory=bool(args.pin_memory),
-                                quant_bits=args.quant_bits,
-                                quant_group_size=args.quant_group_size,
-                                cache_dir=args.cache_dir,
-                                local_ranks=args.local_ranks,
-                                dtype=get_dtype(args.dtype),
-                                attn_impl=args.attn_impl,)
+    target_modules: List[str] = ["q_proj", "k_proj", "v_proj"]
+    models: List[torch.nn.Module] = [ None, None ]
+    models[0] = create_chunk_model(model_name=args.model_name,
+                                   pin_memory=bool(args.pin_memory),
+                                   quant_bits=args.quant_bits,
+                                   quant_group_size=args.quant_group_size,
+                                   cache_dir=args.cache_dir,
+                                   local_rank=args.local_ranks[0],
+                                   dtype=get_dtype(args.dtype),
+                                   attn_impl="eager",
+                                   target_modules=target_modules)
+    models[1] = create_chunk_model(model_name=args.model_name,
+                                   pin_memory=bool(args.pin_memory),
+                                   quant_bits=args.quant_bits,
+                                   quant_group_size=args.quant_group_size,
+                                   cache_dir=args.cache_dir,
+                                   local_rank=args.local_ranks[1],
+                                   dtype=get_dtype(args.dtype),
+                                   attn_impl=args.attn_impl,
+                                   target_modules=target_modules)
+    copy_models(models[0], models[1])
+    check_two_same_models(models[0], models[1])
+
     # create optimizer
     optimizers = (torch.optim.AdamW(models[0].parameters(), lr=3e-4), \
                   torch.optim.AdamW(models[1].parameters(), lr=3e-4),)

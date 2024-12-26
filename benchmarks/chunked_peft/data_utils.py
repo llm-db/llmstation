@@ -38,7 +38,7 @@ def load_data(model_name: str,
             )
         if len(sample_raw["output"]):
             sample_text += sample_raw["output"]
-        # NOTE: no padding
+        # NOTE: no padding, as batch size = 1 for chunked fine-tuning co-serving
         # sample_tokens = tokenizer(sample_text, truncation=True, padding="max_length", max_length=seq_len)
         sample_tokens = tokenizer(sample_text, truncation=True, max_length=seq_len)
         return sample_tokens
@@ -48,7 +48,7 @@ def load_data(model_name: str,
             sample_text = sample_raw["source"]
         if len(sample_raw["target"]):
             sample_text += sample_raw["target"]
-        # NOTE: no padding
+        # NOTE: no padding, as batch size = 1 for chunked fine-tuning co-serving
         # sample_tokens = tokenizer(sample_text, truncation=True, padding="max_length", max_length=seq_len)
         sample_tokens = tokenizer(sample_text, truncation=True, max_length=seq_len)
         return sample_tokens
@@ -64,7 +64,6 @@ def load_data(model_name: str,
     
     # FIXME: only keep long-enough samples (# tokens == seq_len) for throughput testing
     print(f"# long-enough samples: {sum([ 1 for input_ids in dataset['train']['input_ids'] if len(input_ids) == seq_len ])}")
-    # print([ len(input_ids) for input_ids in dataset['train']['input_ids'] ])
     dataset['train'] = dataset['train'].filter(lambda tokens: len(tokens['input_ids']) == seq_len)
 
     dataloader = torch.utils.data.DataLoader(

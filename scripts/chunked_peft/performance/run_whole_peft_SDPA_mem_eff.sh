@@ -22,7 +22,7 @@ do
                      --gradient_accumulation_steps 1 \
                      --seq_len ${seq_len} \
                      --chunk_size ${chunk_size} \
-                     --local_rank 2 \
+                     --local_rank 0 \
                      --pin_memory 0 \
                      --quant_bits 16 \
                      --quant_group_size 64 \

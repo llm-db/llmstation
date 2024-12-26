@@ -23,7 +23,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     repeat_kv,
 )
 
-from benchmarks.chunked_peft.chunk_utils import chunk_sdpa, _chunk_flash_attention_forward
+from benchmarks.chunked_peft.chunk_utils import chunk_sdpa, _chunk_flash_attention_forward, flex_attention_compiled, chunk_attn_identity
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2
@@ -309,7 +309,6 @@ class Qwen2ChunkFlashAttention2(Qwen2Attention):
 
 
 
-
 class Qwen2ChunkSdpaAttention(Qwen2Attention):
     """
     Qwen2 attention module using wrapped torch.nn.functional.scaled_dot_product_attention to support chunked backward. This module inherits from
@@ -385,10 +384,111 @@ class Qwen2ChunkSdpaAttention(Qwen2Attention):
             value_states = value_states.contiguous()
 
 
-        # FIXME: add bwd hook to observe grads
-        # query_states.register_hook(lambda grad: print(f"query states grad: {grad.shape}"))
-        # key_states.register_hook(lambda grad: print(f"key states grad: {grad.shape}"))
-        # value_states.register_hook(lambda grad: print(f"value states grad: {grad.shape}"))
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+        # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+        is_causal = True if causal_mask is None and q_len > 1 else False
+
+
+        # NOTE: [chunked fine-tuning] sdpa -> chunk_sdpa
+        start_pos: int = cache_position[0].item()
+        end_pos: int   = cache_position[-1].item()+1
+        attn_output = chunk_sdpa(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=is_causal,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            layer_idx=self.layer_idx,
+            past_kv_grads=past_key_value,
+            num_key_value_groups=self.num_key_value_groups,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+
+
+class Qwen2ChunkSdpaHookAttention(Qwen2Attention):
+    """
+    Qwen2 attention module using wrapped torch.nn.functional.scaled_dot_product_attention to support chunked backward. This module inherits from
+    `Qwen2Attention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+    SDPA API.
+    """
+
+    # Adapted from Qwen2Attention.forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "Qwen2Model is using Qwen2SdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        causal_mask = attention_mask
+        if attention_mask is not None:  # no matter the length, we just slice it
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and attention_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
 
 
         # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
@@ -397,30 +497,136 @@ class Qwen2ChunkSdpaAttention(Qwen2Attention):
         is_causal = True if causal_mask is None and q_len > 1 else False
 
 
-        # FIXME: sdpa -> chunk_sdpa
-        # attn_output = torch.nn.functional.scaled_dot_product_attention(
-        #     query_states,
-        #     key_states,
-        #     value_states,
-        #     attn_mask=causal_mask,
-        #     dropout_p=self.attention_dropout if self.training else 0.0,
-        #     is_causal=is_causal,
-        # )
-        attn_output = chunk_sdpa(
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
             attn_mask=causal_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
-            start_pos=cache_position[0].item(),
-            end_pos=cache_position[-1].item()+1,
+        )
+
+
+        # NOTE: [chunked fune-tuning] add hooks to post-process grads
+        start_pos=cache_position[0].item()
+        end_pos=cache_position[-1].item()+1
+        layer_idx=self.layer_idx
+
+        def key_hook_fn(grad):
+            valid_key_grad = past_key_value.update_key_grads(grad, start_pos, end_pos, layer_idx)
+            return valid_key_grad
+        def value_hook_fn(grad):
+            valid_value_grad = past_key_value.update_value_grads(grad, start_pos, end_pos, layer_idx)
+            return valid_value_grad
+        
+        if key_states.requires_grad:
+            key_states.register_hook(key_hook_fn)
+        if value_states.requires_grad:
+            value_states.register_hook(value_hook_fn)
+
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+
+
+class Qwen2ChunkFlexAttention(Qwen2Attention):
+    """
+    Qwen2 attention module using wrapped torch.nn.functional.scaled_dot_product_attention to support chunked backward. This module inherits from
+    `Qwen2Attention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+    SDPA API.
+    """
+
+    # Adapted from Qwen2Attention.forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "Qwen2Model is using Qwen2SdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+
+        # NOTE: [chunked fine-tuning] flex attention
+        start_pos=cache_position[0].item()
+        end_pos=cache_position[-1].item()+1
+        key_states = chunk_attn_identity(
+            key_states, 
+            is_key=True,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            layer_idx=self.layer_idx,
+            past_kv_grads=past_key_value,
+        )
+        value_states = chunk_attn_identity(
+            value_states, 
+            is_key=False,
+            start_pos=start_pos,
+            end_pos=end_pos,
             layer_idx=self.layer_idx,
             past_kv_grads=past_key_value,
         )
 
-        # FIXME: add bwd hook to observe grads
-        # attn_output.register_hook(lambda grad: print(f"attn output grad: {grad.shape}"))
+        assert self.attention_dropout == 0.0, "In Pytorch 2.5, Flex Attention only supports zero attn dropout..."
+
+        block_mask = past_key_value.block_mask
+        attn_output = flex_attention_compiled(
+            query_states, 
+            key_states, 
+            value_states, 
+            block_mask=block_mask.to(device=query_states.device), 
+        )
 
 
         attn_output = attn_output.transpose(1, 2).contiguous()

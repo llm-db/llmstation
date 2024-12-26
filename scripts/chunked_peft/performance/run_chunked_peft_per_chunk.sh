@@ -4,9 +4,9 @@ dtypes=("bf16" "fp16")
 # dtypes=("fp16")
 # seq_lens=(512 1024)
 # seq_lens=(512)
-# seq_lens=(1024)
+seq_lens=(1024)
 # seq_lens=(768)
-seq_lens=(128)
+# seq_lens=(128)
 # seeds=(39 40 41 42 43 44 45)
 seeds=(42)
 for dtype in ${dtypes[@]}
@@ -17,7 +17,7 @@ do
               echo current seq_len: ${seq_len}
               if [ ${seq_len} -eq 1024 ]; then
                      # chunk_sizes=(32 64 128 256 512 1024)
-                     chunk_sizes=(128)
+                     chunk_sizes=(512)
               else
                      # chunk_sizes=(32 64 128 256 512)
                      # chunk_sizes=(16)

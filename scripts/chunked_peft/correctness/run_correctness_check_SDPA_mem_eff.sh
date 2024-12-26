@@ -7,7 +7,7 @@ python -m benchmarks.chunked_peft.correctness.correctness_check \
        --batch_size 1 \
        --gradient_accumulation_steps 1 \
        --seq_len 256 \
-       --chunk_size 128 \
+       --chunk_size 32 \
        --tolerances 5e-4 5e-4 \
        --local_ranks 0 1 \
        --pin_memory 0 \

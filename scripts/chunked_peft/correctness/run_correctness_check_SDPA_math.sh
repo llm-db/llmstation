@@ -7,7 +7,7 @@ python -m benchmarks.chunked_peft.correctness.correctness_check \
        --batch_size 1 \
        --gradient_accumulation_steps 1 \
        --seq_len 256 \
-       --chunk_size 128 \
+       --chunk_size 16 \
        --tolerances 1e-9 1e-9 \
        --local_ranks 2 3 \
        --pin_memory 0 \
@@ -16,4 +16,4 @@ python -m benchmarks.chunked_peft.correctness.correctness_check \
        --cache_dir /pub/scratch/yanghao/datasets/ \
        --dtype fp64 \
        --attn_impl math \
-       --print_out y
+       --print_out n

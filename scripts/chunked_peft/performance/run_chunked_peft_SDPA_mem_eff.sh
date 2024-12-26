@@ -1,6 +1,6 @@
 #!/bin/bash
-dtypes=("bf16" "fp16")
-# dtypes=("bf16")
+# dtypes=("bf16" "fp16")
+dtypes=("bf16")
 # dtypes=("fp16")
 # seq_lens=(512 1024)
 # seq_lens=(512)
@@ -17,10 +17,10 @@ do
               echo current seq_len: ${seq_len}
               if [ ${seq_len} -eq 1024 ]; then
                      # chunk_sizes=(32 64 128 256 512 1024)
-                     chunk_sizes=(128)
+                     chunk_sizes=(8)
               else
                      # chunk_sizes=(32 64 128 256 512)
-                     chunk_sizes=(512)
+                     chunk_sizes=(128)
               fi
 
               echo chunk_sizes: ${chunk_sizes[@]}
@@ -38,7 +38,7 @@ do
                             --gradient_accumulation_steps 1 \
                             --seq_len ${seq_len} \
                             --chunk_size ${chunk_size} \
-                            --local_rank 2 \
+                            --local_rank 0 \
                             --pin_memory 0 \
                             --quant_bits 16 \
                             --quant_group_size 64 \

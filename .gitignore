@@ -2,6 +2,7 @@ __pycache__
 results
 *.ipynb
 *.pdf
+*.png
 chunk-*
 *chunk+*
 requirements_*
