@@ -1,13 +1,2 @@
 __pycache__
 results
-*.ipynb
-*.pdf
-*.png
-chunk-*
-*chunk+*
-requirements_*
-benchmarks/naive_chunk/tmp
-benchmarks/naive_chunk/naive*
-benchmarks/naive_chunk/performance/*mod.py
-benchmarks/naive_chunk_archived/
-scripts/naive_chunk_archived

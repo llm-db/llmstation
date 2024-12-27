@@ -18,11 +18,11 @@ from transformers.utils import (
 from transformers.modeling_flash_attention_utils import (
     fa_peft_integration_check,
     _upad_input,
-    pad_input,
 )
 from peft import LoraConfig, get_peft_model
 
 if is_flash_attn_2_available():
+    from transformers.modeling_flash_attention_utils import pad_input
     from flash_attn.flash_attn_interface import (
         _wrapped_flash_attn_forward,
         _wrapped_flash_attn_backward,
@@ -32,79 +32,6 @@ if is_flash_attn_2_available():
     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
     flash_241 = is_flash_attn_greater_or_equal("2.4.1")
     deterministic_g = os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
-
-if torch.__version__ >= "2.5.0":
-    from torch.nn.attention.flex_attention import flex_attention
-    flex_attention_compiled = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
-
-
-### Flex Attention
-
-def create_chunk_block_mask(
-    num_processed_tokens: int,
-    num_total_tokens: int,
-    chunk_size: int,    
-):
-    start_pos: int = num_processed_tokens
-    q_len = min(chunk_size, num_total_tokens-num_processed_tokens)
-    end_pos: int = q_len + num_processed_tokens
-    def causal(b, h, q_idx, kv_idx):
-        return q_idx+start_pos >= kv_idx
-    
-    from torch.nn.attention.flex_attention import create_block_mask
-    block_mask = create_block_mask(causal, B=None, H=None, Q_LEN=q_len, KV_LEN=end_pos, BLOCK_SIZE=(128, 128), _compile=True)
-    return block_mask
-
-class ChunkAttnIdentity(torch.autograd.Function):
-    @staticmethod
-    def forward(key_or_value, is_key=True, start_pos=0, end_pos=-1, layer_idx=-1, past_kv_grads=None):
-        output_key_or_value = key_or_value * 1.0
-        return output_key_or_value
-    
-    @staticmethod
-    def setup_context(ctx, inputs, output):
-        key_or_value, is_key, start_pos, end_pos, layer_idx, past_kv_grads = inputs
-        ctx.is_key = is_key
-        ctx.layer_idx = layer_idx
-        ctx.start_pos = start_pos
-        ctx.end_pos = end_pos
-        ctx.past_kv_grads = past_kv_grads
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        grad_key_or_value = grad_output
-
-        start_pos: int = ctx.start_pos
-        end_pos: int = ctx.end_pos
-        layer_idx: int = ctx.layer_idx
-        past_kv_grads: ChunkCache = ctx.past_kv_grads
-        is_key: bool = ctx.is_key
-
-        if is_key:
-            grad_key_or_value = past_kv_grads.update_key_grads(grad_key_or_value, start_pos, end_pos, layer_idx)
-        else:
-            grad_key_or_value = past_kv_grads.update_value_grads(grad_key_or_value, start_pos, end_pos, layer_idx)
-        
-        return grad_key_or_value, None, None, None, None, None
-
-
-def chunk_attn_identity(
-    key_or_value,
-    is_key,
-    start_pos,
-    end_pos,
-    layer_idx,
-    past_kv_grads
-):
-    return ChunkAttnIdentity.apply(
-        key_or_value,
-        is_key,
-        start_pos,
-        end_pos,
-        layer_idx,
-        past_kv_grads
-    )
-
 
 ### Chunked FlashAttention
 
@@ -449,17 +376,19 @@ class ChunkSDPA(torch.autograd.Function):
         return grad_query, grad_key, grad_value, None, None, None, None, None, None, None, None
 
 
-def chunk_sdpa(query_states: torch.Tensor,
-               key_states: torch.Tensor,
-               value_states: torch.Tensor,
-               attn_mask: torch.Tensor,
-               dropout_p: float,
-               is_causal: bool,
-               start_pos: int,
-               end_pos: int,
-               layer_idx: int,
-               past_kv_grads: "ChunkCache",
-               num_key_value_groups: int = 1):
+def chunk_sdpa(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attn_mask: torch.Tensor,
+    dropout_p: float,
+    is_causal: bool,
+    start_pos: int,
+    end_pos: int,
+    layer_idx: int,
+    past_kv_grads: "ChunkCache",
+    num_key_value_groups: int = 1,
+):
     return ChunkSDPA.apply(
         query_states, 
         key_states, 
@@ -483,7 +412,6 @@ class ChunkCache(DynamicCache):
         self.value_grads_cache = []
         self.max_layer_idx = None
         self.attn_impl = attn_impl
-        self.block_mask = None # for Flex Attention
 
     def detach_kv_cache(self):
         new_key_cache   = []
@@ -594,24 +522,6 @@ class ChunkCache(DynamicCache):
         valid_value_grads = self.update_value_grads(value_grad, start_pos, end_pos, layer_idx)
         return valid_key_grads, valid_value_grads
 
-
-class Printer:
-    def __init__(self) -> None:
-        self.PRINT_OUT = True
-        torch.set_printoptions(precision=16, sci_mode=False)
-
-    def open(self) -> None:
-        self.PRINT_OUT = True
-
-    def close(self) -> None:
-        self.PRINT_OUT = False
-
-    def print(self, context: str) -> None:
-        if self.PRINT_OUT:
-            print(context)
-
-printer = Printer()
-
 INVALID_TARGET: int = -100
 
 def fix_randomness_determinism(seed: int = 42, deterministic: bool = False) -> None:
@@ -638,11 +548,9 @@ def fixed_cross_entropy(source, target, num_items_in_batch: int = None, ignore_i
 def get_hf_model(
     model_name: str,
     pin_memory: Union[str, bool],
-    quant_bits: int,
-    quant_group_size: int,
     cache_dir: str,
     dtype: torch.dtype = torch.bfloat16,
-    attn_impl: str = "flash_attn",
+    attn_impl: str = "mem_efficient",
     lora_r: int = 64,
     lora_alpha: int = 32,
     lora_dropout: float = 0.0,
@@ -661,6 +569,7 @@ def get_hf_model(
     elif attn_impl == "flash":
         torch.backends.cuda.enable_flash_sdp(enabled=True)
     elif attn_impl == "cudnn" and torch.__version__ >= "2.5.0":
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         torch.backends.cuda.enable_cudnn_sdp(enabled=True)
 
     config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
@@ -670,13 +579,13 @@ def get_hf_model(
         config._attn_implementation = attn_impl
     
     pin_memory = bool(pin_memory)
-    if quant_bits == 4:
-        raise NotImplementedError()
 
-    base_model = AutoModelForCausalLM.from_pretrained(model_name, 
-                                                      config=config, 
-                                                      cache_dir=cache_dir, 
-                                                      torch_dtype=dtype)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_name, 
+        config=config, 
+        cache_dir=cache_dir, 
+        torch_dtype=dtype
+    )
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
@@ -691,36 +600,29 @@ def get_hf_model(
     return model
 
 def copy_models(src_model: torch.nn.Module, tgt_model: torch.nn.Module) -> None:
-    printer.print("synchronizing initial parameters...")
     tgt_model.load_state_dict(src_model.state_dict())
 
 def check_two_same_models(src_model: torch.nn.Module, tgt_model: torch.nn.Module) -> None:
-    printer.print("checking if the two models are the same...")
     for w, c in zip(list(src_model.parameters()), list(tgt_model.parameters())):
         assert (w.data.cpu() == c.data.cpu()).all()
 
-def create_chunk_model(model_name: str,
-                       pin_memory: bool,
-                       quant_bits: int,
-                       quant_group_size: int,
-                       cache_dir: str,
-                       local_rank: int = 0,
-                       dtype: torch.dtype = torch.bfloat16,
-                       attn_impl: str = "mem_efficient",
-                       lora_r: int = 64,
-                       lora_alpha: int = 32,
-                       lora_dropout: float = 0.0,
-                       target_modules: List[str] = ["q_proj", "v_proj"],
-                       ) -> torch.nn.Module:
+def create_chunk_model(
+    model_name: str,
+    pin_memory: bool,
+    cache_dir: str,
+    local_rank: int = 0,
+    dtype: torch.dtype = torch.bfloat16,
+    attn_impl: str = "mem_efficient",
+    lora_r: int = 64,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.0,
+    target_modules: List[str] = ["q_proj", "v_proj"],
+) -> torch.nn.Module:
     torch.cuda.set_device(local_rank)
-    printer.print(f"loading model...")
-    # for comparison, always set the first model as eager impl [whole fwd & bwd]
-    # cur_attn_impl: str = "eager" if len(local_ranks) > 1 and idx == 0 else attn_impl
+    
     model: torch.nn.Module = get_hf_model(
         model_name,
         pin_memory,
-        quant_bits,
-        quant_group_size,
         cache_dir,
         dtype=dtype,
         attn_impl=attn_impl,
@@ -759,24 +661,3 @@ def get_dtype(dtype_str: str) -> torch.dtype:
     if target_dtype is None:
         raise NotImplementedError()
     return target_dtype
-
-def add_print_backward_hooks(model: torch.nn.Module):
-    def backward_hook_fn(module: torch.nn.Module, 
-                         grad_in: torch.Tensor, 
-                         grad_out: torch.Tensor):
-        if grad_in[0] is not None:
-            printer.print(f"module: {module._get_name()}; " + \
-                          f"grad_in shape: {grad_in[0].shape}; " + \
-                          f"grad_out shape: {grad_out[0].shape}")
-        else:
-            printer.print(f"module: {module._get_name()}; " + \
-                          f"grad_in shape: {grad_in[1].shape}; " + \
-                          f"grad_out shape: {grad_out[0].shape}")
-    
-    def register_backward_hooks(model: torch.nn.Module):
-        modules = model.named_modules()
-        for name, module in modules:
-            printer.print(f"add backward hook for module: {name}")
-            module.register_backward_hook(backward_hook_fn)
-    
-    register_backward_hooks(model)
