@@ -129,6 +129,7 @@ if __name__ == "__main__":
     )
     
     # create model
+    target_modules: List[str] = ["q_proj", "k_proj", "v_proj"]
     model = create_chunk_model(
         model_name=args.model_name,
         pin_memory=bool(args.pin_memory),
@@ -136,6 +137,7 @@ if __name__ == "__main__":
         local_rank=args.local_rank,
         dtype=get_dtype(args.dtype),
         attn_impl=args.attn_impl,
+        target_modules=target_modules,
     )
     # create optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)

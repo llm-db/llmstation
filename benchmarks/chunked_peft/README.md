@@ -1,6 +1,14 @@
 # Chunked Fine-Tuning / PEFT
 
-One thing to note is that even in the latest stable version, `torch 2.5.1`, SDPA flash attn cannot be used since in chunked fine-tuning, (1) the causal mask fed to `sdpa` kernel is not none, (2) and for the non mask case, `q_len = k_len` is required, where `q_len` $\neq$ `k_len` starting from the 2nd chunk. Some discussion can be seen in https://github.com/pytorch/torchtune/issues/1380, and https://huggingface.co/docs/optimum/bettertransformer/overview. Therefore, to use `FA2`, please install `flash_attn` and set `attn_impl` as `flash_attention_2`.
+One thing to note is that even in the latest stable version, `torch 2.5.1`, SDPA flash attn cannot be used since in chunked fine-tuning, (1) the causal mask fed to `sdpa` kernel is not none, (2) and for the non mask case, `q_len = k_len` is required, where `q_len` $\neq$ `k_len` starting from the 2nd chunk. Some discussions can be seen in https://github.com/pytorch/torchtune/issues/1380, and https://huggingface.co/docs/optimum/bettertransformer/overview. Therefore, to use `FA2`, please install `flash_attn` and set `attn_impl` as `flash_attention_2`.
+
+## Environment Setup
+
+```[shell]
+conda create -n FineInferChunked python=3.12
+conda activate FineInferChunked
+pip install -r requirements.txt
+```
 
 ## Correctness Verification
 
