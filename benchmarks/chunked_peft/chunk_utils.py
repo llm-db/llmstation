@@ -568,7 +568,8 @@ def get_hf_model(
         torch.backends.cuda.enable_mem_efficient_sdp(enabled=True)
     elif attn_impl == "flash":
         torch.backends.cuda.enable_flash_sdp(enabled=True)
-    elif attn_impl == "cudnn" and torch.__version__ >= "2.5.0":
+    elif attn_impl == "cudnn":
+        assert torch.__version__ >= "2.5.0", "SDPA cuDNN is only supported in torch 2.5.0+."
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         torch.backends.cuda.enable_cudnn_sdp(enabled=True)
 
