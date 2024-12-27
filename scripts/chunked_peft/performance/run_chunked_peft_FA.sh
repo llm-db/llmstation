@@ -34,7 +34,8 @@ do
                      python -m benchmarks.chunked_peft.performance.chunked_peft \
                             --model_name /pub/scratch/yanghao/models/huggingface/meta-llama/Llama-3.1-8B \
                             --dataset_name sordonia/flan-10k-flat \
-                            --trials 2 \
+                            --trials 20 \
+                            --warmup 10 \
                             --batch_size 1 \
                             --gradient_accumulation_steps 1 \
                             --seq_len ${seq_len} \
@@ -49,7 +50,7 @@ do
                             --dtype $dtype \
                             --seed $seed \
                             --res_folder results/naive_chunk/performance/ \
-                            --show_chunk_time n \
+                            --show_chunk_time y \
                             --print_out n
                      done
               done

@@ -23,8 +23,15 @@ from transformers.models.qwen2.modeling_qwen2 import (
     repeat_kv,
 )
 
-from benchmarks.chunked_peft.chunk_utils import chunk_sdpa, _chunk_flash_attention_forward, flex_attention_compiled, chunk_attn_identity
-
+from benchmarks.chunked_peft.chunk_utils import (
+    chunk_sdpa, 
+    _chunk_flash_attention_forward,
+)
+if torch.__version__ >= "2.5.0":
+    from benchmarks.chunked_peft.chunk_utils import (
+        flex_attention_compiled, 
+        chunk_attn_identity,
+    )
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2
 class Qwen2RMSNorm(nn.Module):
@@ -39,7 +46,8 @@ class Qwen2RMSNorm(nn.Module):
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         
-        # FIXME: [higher precision for correctness check] float32 -> float64
+        # NOTE: [chunked fine-tuning, higher precision for correctness check] 
+        #       float32 -> float64 [float64 in verification]
         # hidden_states = hidden_states.to(torch.float32)
         hidden_states = hidden_states.to(torch.float64)
         
@@ -132,28 +140,20 @@ class Qwen2Attention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-
-        # FIXME: add bwd hook to observe grads
-        # query_states.register_hook(lambda grad: print(f"query states grad: {grad.shape}"))
-        # key_states.register_hook(lambda grad: print(f"key states grad: {grad.shape}"))
-        # value_states.register_hook(lambda grad: print(f"value states grad: {grad.shape}"))
-
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
-        # upcast attention to fp32
-        # FIXME: [higher precision for correctness check] float32 -> float64
+        # original: upcast attention to fp32; new convert to float64
+        # NOTE: [chunked fine-tuning, higher precision for correctness check] 
+        #       float32 -> float64 [float64 in verification]
+        #       eager attention is only used in whole fine-tuning as numerical baseline
         # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float64).to(query_states.dtype)
         
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
-
-        # FIXME: add bwd hook to observe grads
-        # attn_weights.register_hook(lambda grad: print(f"attn weights grad: {grad.shape}"))
-
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -255,7 +255,8 @@ class Qwen2ChunkFlashAttention2(Qwen2Attention):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
-        # FIXME: convert to bf16 to fit in with FA-2
+        # NOTE: [chunked fine-tuning, for correctness check] 
+        #       convert to bf16 to fit in with FA-2
         if input_dtype != torch.bfloat16:
             target_dtype = torch.bfloat16
             query_states = query_states.to(target_dtype)
@@ -276,9 +277,8 @@ class Qwen2ChunkFlashAttention2(Qwen2Attention):
         else:
             sliding_window = None
 
-        # breakpoint()
 
-        # FIXME: FA -> chunk FA
+        # NOTE: [chunked fine-tuning, for correctness check] FA -> chunk FA
         attn_output = _chunk_flash_attention_forward(
             query_states,
             key_states,
@@ -296,7 +296,8 @@ class Qwen2ChunkFlashAttention2(Qwen2Attention):
             past_kv_grads=past_key_value,
         )
 
-        # FIXME: convert back to input_dtype
+        # NOTE: [chunked fine-tuning, higher precision for correctness check] 
+        # convert back to input_dtype
         attn_output = attn_output.to(dtype=input_dtype)
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
@@ -390,7 +391,7 @@ class Qwen2ChunkSdpaAttention(Qwen2Attention):
         is_causal = True if causal_mask is None and q_len > 1 else False
 
 
-        # NOTE: [chunked fine-tuning] sdpa -> chunk_sdpa
+        # NOTE: [chunked fine-tuning, higher precision for correctness check] sdpa -> chunk_sdpa
         start_pos: int = cache_position[0].item()
         end_pos: int   = cache_position[-1].item()+1
         attn_output = chunk_sdpa(
@@ -507,7 +508,7 @@ class Qwen2ChunkSdpaHookAttention(Qwen2Attention):
         )
 
 
-        # NOTE: [chunked fune-tuning] add hooks to post-process grads
+        # NOTE: [chunked fine-tuning, higher precision for correctness check] ] add hooks to post-process grads
         start_pos=cache_position[0].item()
         end_pos=cache_position[-1].item()+1
         layer_idx=self.layer_idx
@@ -598,7 +599,7 @@ class Qwen2ChunkFlexAttention(Qwen2Attention):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
 
-        # NOTE: [chunked fine-tuning] flex attention
+        # NOTE: [chunked fine-tuning, higher precision for correctness check] flex attention
         start_pos=cache_position[0].item()
         end_pos=cache_position[-1].item()+1
         key_states = chunk_attn_identity(
@@ -717,11 +718,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         
-
-        # FIXME: [make dQ, dK, dV valid in the graph]
-        # inputs_embeds.requires_grad_()
-
-
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -837,7 +833,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         dtype, device = input_tensor.dtype, input_tensor.device
         
-        # FIXME: [higher precision for correctness check] dtype min -> -inf
+        # NOTE: [chunked fine-tuning, higher precision for correctness check] dtype min -> -inf
         # For SDPA w. CUDA
         # min_dtype = torch.finfo(dtype).min
         min_dtype = -torch.inf
@@ -933,23 +929,23 @@ class Qwen2Model(Qwen2PreTrainedModel):
             # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
             causal_mask = attention_mask
         else:
-            # FIXME: [higher precision for correctness check] dtype min -> -inf
+            # NOTE: [chunked fine-tuning, higher precision for correctness check] dtype min -> -inf
             # min_dtype = torch.finfo(dtype).min
-            
-            min_dtype = -torch.inf # torch.finfo(dtype).min
-
+            min_dtype = -torch.inf
 
             causal_mask = torch.full(
                 (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
             )
             
-            # FIXME: [higher precision for correctness check] avoid * (-inf) operations
+            # NOTE: [chunked fine-tuning, higher precision for correctness check] avoid * (-inf) operations
             causal_mask = torch.where(torch.arange(target_length, device=device) > cache_position.reshape(-1, 1),
                                       causal_mask, torch.zeros_like(causal_mask))
             # diagonal_attend_mask = torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
 
 
-            # FIXME: [higher precision for correctness check] ignoring sliding windows
+            # NOTE: [chunked fine-tuning, higher precision for correctness check] ignoring sliding windows
+            #       as currently only exact attention computation mechanism is considered
+
             # if config.sliding_window is not None:
             #     # if we have sliding window, we should not attend to tokens beyond sliding window length, so we mask them out also
             #     # the check is needed to verify is current checkpoint was trained with sliding window or not
@@ -959,12 +955,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
             #         )
             #         diagonal_attend_mask.bitwise_or_(sliding_attend_mask)
             
-            # FIXME: [higher precision for correctness check] avoid * (-inf) operations
+            # NOTE: [chunked fine-tuning, higher precision for correctness check] avoid * (-inf) operations
+            #       as sliding windown attention is ignored, here we can omit this operation
+
             # causal_mask *= diagonal_attend_mask
             
             causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
             
-            # FIXME: [higher precision for correctness check] no left padding for verification => skip this part
+            # NOTE: [chunked fine-tuning, higher precision for correctness check] no left padding for verification => skip this part
+            #       For chunked fine-tuning in co-serving settings, as FT batch_size = 1, there is no left padding
+            
             # if attention_mask is not None:
             #     causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
             #     if attention_mask.shape[-1] > target_length:

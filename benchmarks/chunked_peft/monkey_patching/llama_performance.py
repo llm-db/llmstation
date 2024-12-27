@@ -18,10 +18,12 @@ from transformers.models.llama.modeling_llama import (
 from benchmarks.chunked_peft.chunk_utils import (
     chunk_sdpa, 
     _chunk_flash_attention_forward, 
-    chunk_attn_identity, 
-    flex_attention_compiled,
 )
-
+if torch.__version__ >= "2.5.0":
+    from benchmarks.chunked_peft.chunk_utils import (
+        flex_attention_compiled, 
+        chunk_attn_identity,
+    )
 
 
 class LlamaChunkFlashAttention2(LlamaAttention):

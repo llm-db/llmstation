@@ -58,6 +58,7 @@ def write_peft_benchmark_log(model_size, activation_size, gpu_peak_mem,
         forward_latency, forward_throughput,
         backward_latency, backward_throughput,
         total_latency, total_throughput,
+        warmup_steps=0,
         fwd_chunk_avg_timings=[],
         bwd_chunk_avg_timings=[],):
 
@@ -72,12 +73,12 @@ def write_peft_benchmark_log(model_size, activation_size, gpu_peak_mem,
                f"total throughput: {total_throughput:.3f} sample/s")
 
     if len(fwd_chunk_avg_timings) > 0 and len(bwd_chunk_avg_timings) > 0:
-        chunk_log_str = (f"\nfwd per chunk avg time (ms): ")
+        chunk_log_str = (f"\nwarmup steps: {warmup_steps}\nfwd per chunk avg time (ms):\t")
         for avg_time in fwd_chunk_avg_timings:
-            chunk_log_str += f"{avg_time:.3f}\t"
-        chunk_log_str += (f"\nbwd per chunk avg time (ms): ")
+            chunk_log_str += f"{1000*avg_time:.1f}\t"
+        chunk_log_str += (f"\nbwd per chunk avg time (ms):\t")
         for avg_time in bwd_chunk_avg_timings:
-            chunk_log_str += f"{avg_time:.3f}\t"
+            chunk_log_str += f"{1000*avg_time:.1f}\t"
         log_str += chunk_log_str
 
     return log_str

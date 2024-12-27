@@ -27,16 +27,20 @@ def get_stat_str(model_name: str,
     forward_latency: float  = sum(forward_timings[warmup_steps:]) / len(forward_timings[warmup_steps:])
     backward_latency: float = total_latency - forward_latency
 
+    assert batch_size == 1, "batch size is set as 1 for chunked fine-tuning..."
+
     fwd_chunk_avg_timings: List[float] = [ ]
     bwd_chunk_avg_timings: List[float] = [ ]
-    if len(fwd_chunk_avg_timings) > warmup_steps and len(fwd_chunk_avg_timings[warmup_steps]) > 0:
-        num_chunk: int = len(fwd_chunk_avg_timings[0])
+    if len(fwd_chunk_timings) > warmup_steps and len(fwd_chunk_timings[warmup_steps]) > 0:
+        num_chunk: int = len(fwd_chunk_timings[warmup_steps])
+        num_valid_steps: int = len(fwd_chunk_timings[warmup_steps:])
         fwd_chunk_avg_timings: List[float] = [ 0.0 ] * num_chunk
         bwd_chunk_avg_timings: List[float] = [ 0.0 ] * num_chunk
-        for idx, fwd_list, bwd_list in enumerate(zip(fwd_chunk_timings[warmup_steps:], 
-                                                     bwd_chunk_timings[warmup_steps:])):
-            fwd_chunk_avg_timings[idx] += fwd_list[idx] / num_chunk
-            bwd_chunk_avg_timings[idx] += bwd_list[idx] / num_chunk
+        for fwd_list, bwd_list in zip(fwd_chunk_timings[warmup_steps:], 
+                                      bwd_chunk_timings[warmup_steps:]):
+            for idx, (fwd_chunk_time, bwd_chunk_time) in enumerate(zip(fwd_list, bwd_list)):
+                fwd_chunk_avg_timings[idx] += fwd_chunk_time / num_valid_steps / batch_size
+                bwd_chunk_avg_timings[idx] += bwd_chunk_time / num_valid_steps / batch_size
 
     total_throughput: float    = batch_size / total_latency
     forward_throughput: float  = batch_size / forward_latency
@@ -55,6 +59,7 @@ def get_stat_str(model_name: str,
         backward_throughput,
         total_latency,
         total_throughput,
+        warmup_steps=warmup_steps,
         fwd_chunk_avg_timings=fwd_chunk_avg_timings,
         bwd_chunk_avg_timings=bwd_chunk_avg_timings,
     )

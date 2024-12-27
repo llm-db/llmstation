@@ -17,7 +17,7 @@ do
               echo current seq_len: ${seq_len}
               if [ ${seq_len} -eq 1024 ]; then
                      # chunk_sizes=(32 64 128 256 512 1024)
-                     chunk_sizes=(8)
+                     chunk_sizes=(256)
               else
                      # chunk_sizes=(32 64 128 256 512)
                      chunk_sizes=(128)
@@ -34,6 +34,7 @@ do
                             --model_name /pub/scratch/yanghao/models/huggingface/meta-llama/Llama-3.1-8B \
                             --dataset_name sordonia/flan-10k-flat \
                             --trials 20 \
+                            --warmup 10 \
                             --batch_size 1 \
                             --gradient_accumulation_steps 1 \
                             --seq_len ${seq_len} \
