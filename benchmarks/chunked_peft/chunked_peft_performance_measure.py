@@ -118,7 +118,9 @@ def chunked_peft_backward(
         if start_event is not None:
             cur_event = torch.cuda.Event(enable_timing=True)
 
-        loss.backward(retain_graph=True)
+        # NOTE: retain_graph = True is a bit faster w/ higher peak gpu mem
+        #       retain_graph = False is slower w/ lower peak gpu mem
+        loss.backward(retain_graph=False)
 
         if start_event is not None:
             cur_event.record()
