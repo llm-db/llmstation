@@ -61,9 +61,7 @@ NOTE: As `torchtune` currently only support `bf16` and `fp32`,  considering nume
 
 ## Performance Measurement
 
-As our use of `torchtune 0.4.0` requires features provided by `torch 2.4.0`, which has support of `SDPA cuDNN attention`, here we consider using this faster (compared to `MEA`) attention kernel to measure performance.
-
-- Whole LORA fine-tuning, SDPA cuDNN attention, bf16
+- Whole LORA fine-tuning, SDPA MEA, bf16
 
     ```[shell]
     torchrun --nnode=1 --nproc-per-node=2 \
@@ -79,7 +77,7 @@ As our use of `torchtune 0.4.0` requires features provided by `torch 2.4.0`, whi
         attn_impl=mem_efficient
     ```
 
-- Chunked LORA fine-tuning, SDPA cuDNN attention, bf16
+- Chunked LORA fine-tuning, SDPA MEA, bf16
 
     ```[shell]
     torchrun --nnode=1 --nproc-per-node=2 \
