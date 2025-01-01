@@ -1,0 +1,107 @@
+### Modified from https://github.com/pytorch/torchtune/blob/v0.4.0/recipes/configs/llama2/7B_lora.yaml
+
+output_dir: /root/codes/fineinfer-chunked/llama2_7B/lora # /tmp may be deleted by your system. Change it to your preference.
+
+# Model Arguments
+model:
+  _component_: torchtune.models.llama2.lora_llama2_7b
+  lora_attn_modules: ['q_proj', 'k_proj', 'v_proj']
+  apply_lora_to_mlp: False
+  apply_lora_to_output: False
+  lora_rank: 64  # higher increases accuracy and memory
+  lora_alpha: 32  # usually alpha=2*rank
+  lora_dropout: 0.0
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /root/models/huggingface/meta-llama/Llama-2-7b-hf/
+  checkpoint_files: [
+    pytorch_model-00001-of-00002.bin,
+    pytorch_model-00002-of-00002.bin
+  ]
+  adapter_checkpoint: null
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/whole_lora_ckpt
+  model_type: LLAMA2
+resume_from_checkpoint: False
+save_adapter_weights_only: True
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.llama2.llama2_tokenizer
+  path: /root/models/huggingface/meta-llama/Llama-2-7b-hf/tokenizer.model
+  max_seq_len: 512
+
+# Dataset and Sampler
+dataset:
+  _component_: benchmarks.chunked_peft.data_utils.instruct_dataset_preprocessed
+  packed: False  # True increases speed
+  source: sordonia/flan-10k-flat
+  cache_dir: /root/datasets/
+  split: train
+  column_map: {"input": "source", "output": "target"}
+  train_on_input: True # train on the whole sequence
+seed: 42
+shuffle: False
+batch_size: 1
+
+# Optimizer and Scheduler
+optimizer:
+  _component_: torch.optim.AdamW
+  fused: False
+  weight_decay: 0.01
+  lr: 2e-4
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 0
+
+loss:
+  _component_: torchtune.modules.loss.CEWithChunkedOutputLoss
+  num_output_chunks: 2 # [chunked peft] keep the same as chunk num to be compared: 512//256
+
+# Training
+epochs: 1
+max_steps_per_epoch: 30
+gradient_accumulation_steps: 1  # Use to increase effective batch size
+compile: False  # torch.compile the model + loss, True increases speed + decreases memory
+debug_mode: 2   # [chunked peft] enable cuDNN determinism
+attn_impl: math # [chunked peft] SDPA math kernal for correctness verification
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Environment
+device: cuda
+dtype: fp32 # [chunked peft] fp32 for correct verification
+enable_activation_checkpointing: False  # True reduces memory
+enable_activation_offloading: False  # True reduces memory
+
+
+# Profiler (disabled)
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+
+  #Output directory of trace artifacts
+  output_dir: ${output_dir}/profiling_outputs
+
+  #`torch.profiler.ProfilerActivity` types to trace
+  cpu: True
+  cuda: True
+
+  #trace options passed to `torch.profiler.profile`
+  profile_memory: False
+  with_stack: False
+  record_shapes: True
+  with_flops: False
+
+  # `torch.profiler.schedule` options:
+  # wait_steps -> wait, warmup_steps -> warmup, active_steps -> active, num_cycles -> repeat
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

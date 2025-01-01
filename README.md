@@ -1,106 +1,96 @@
-# Chunked Fine-Tuning / PEFT
+# Distributed Chunked PEFT w/ Torchtune
 
-One thing to note is that even in the latest stable version, `torch 2.5.1`, SDPA flash attn cannot be used since in chunked fine-tuning, (1) the causal mask fed to `sdpa` kernel is not none, (2) and for the non mask case, `q_len = k_len` is required, where `q_len` $\neq$ `k_len` starting from the 2nd chunk. Some discussions can be seen in https://github.com/pytorch/torchtune/issues/1380, and https://huggingface.co/docs/optimum/bettertransformer/overview. Therefore, to use `FA2`, please install `flash_attn` and set `attn_impl` as `flash_attention_2`.
+One thing to note is that [torchtune](https://pytorch.org/torchtune/stable/index.html) supports `sdpa` and `flex attention`, while [Flex Attention](https://arxiv.org/pdf/2412.05496) is a new feature appearing in `torch 2.5.0` which works well in `torch.compile` and still in development. Therefore, here we only consider the `sdpa` kernel. 
 
-## Environment Setup
+Similar to the single-node case, even in the latest stable version, `torch 2.5.1`, SDPA flash attn cannot be used since in chunked fine-tuning, (1) the causal mask fed to sdpa kernel is not none, (2) and for the non mask case, `q_len = k_len` is required, where `q_len` $\neq$ `k_len` starting from the 2nd chunk. Some discussions can be seen in https://github.com/pytorch/torchtune/issues/1380, and https://github.com/pytorch/pytorch/issues/108108.
+
+Hence, we mainly consider the `SDPA memory efficient attention`. For `torch 2.5.0+`, `SDPA cuDNN attention` is also supported.
+
+
+## Environment Setups
 
 ```[shell]
-conda create -n FineInferChunked python=3.12
-conda activate FineInferChunked
+conda create -n FineInferChunkedDist python=3.12
+conda activate FineInferChunkedDist
 pip install -r requirements.txt
+```
+
+## Download Torchtune Models
+
+```
+tune download meta-llama/Llama-2-7b-hf  --output-dir <YOUR LLAMA-2-7B-HF PATH>  --ignore-patterns "*.safetensors"
+tune download meta-llama/Llama-2-13b-hf --output-dir <YOUR LLAMA-2-13B-HF PATH> --ignore-patterns "*.safetensors"
 ```
 
 ## Correctness Verification
 
-NOTE: Considering numerical stability issues, SDPA math which supports fp64 is recommended for correctness verification, as SDPA attn mode can be seamlessly switched by Pytorch level `enable/disable`. 
+NOTE: As `torchtune` currently only support `bf16` and `fp32`,  considering numerical stability issues, which is further enlarged by [Fully Sharded Data Parallel (FSDP)](https://www.vldb.org/pvldb/vol16/p3848-huang.pdf), here we use the global loss in consecutive training steps (recorded in the `log`) as the metric to verify the correctness.
 
-- Eager [standard attn, fp64] v.s. Torch SDPA [math, fp64]
+- Whole LORA fine-tuning, SDPA math attention, fp32
 
     ```[shell]
-    python -m benchmarks.chunked_peft.chunked_peft_correctness_check \
-       --model_name <YOUR QWEN2.5-1.5B PATH> \
-       --dataset_name yahma/alpaca-cleaned \
-       --trials 100 \
-       --seq_len 256 \
-       --chunk_size 16 \
-       --tolerances 1e-9 1e-9 \
-       --local_ranks 0 1 \
-       --cache_dir <YOUR DATASET CACHE DIR> \
-       --dtype fp64 \
-       --attn_impl math
+    torchrun --nnode=1 --nproc-per-node=2 \
+        -m benchmarks.chunked_peft.lora_ft_dist_whole \
+        --config benchmarks/chunked_peft/configs/llama2_7b_lora_dist_whole_correctness.yaml \
+        output_dir=<YOUR OUTPUT FOLDER PATH> \
+        checkpoint_dir=<YOUR MODEL CKPT PATH> \
+        tokenizer.path=<YOUR TOKENIZER PATH> \
+        cache_dir=<YOUR DATASET CACHE PATH> \
+        max_steps_per_epoch=30 \
+        tokenizer.max_seq_len=512 \
+        num_output_chunks=2 \
+        attn_impl=math
     ```
 
-- Eager [standard attn, fp32] v.s. Torch SDPA [memory efficient attn, fp32]
+- Chunked LORA fine-tuning, SDPA math attention, fp32
 
-    This can be done, but only with small `trials` and high `tolerances`, as the accumulated numerical errors w.r.t. `fp32` go larger through iterations.
+    ```[shell]
+    torchrun --nnode=1 --nproc-per-node=2 \
+        -m benchmarks.chunked_peft.lora_ft_dist_chunked \
+        --config benchmarks/chunked_peft/configs/llama2_7b_lora_dist_chunked_correctness.yaml \
+        output_dir=<YOUR OUTPUT FOLDER PATH> \
+        checkpoint_dir=<YOUR MODEL CKPT PATH> \
+        tokenizer.path=<YOUR TOKENIZER PATH> \
+        cache_dir=<YOUR DATASET CACHE PATH> \
+        max_steps_per_epoch=30 \
+        tokenizer.max_seq_len=512 \
+        chunk_size=256 \
+        attn_impl=math
+    ```
 
-    ```
-    python -m benchmarks.chunked_peft.chunked_peft_correctness_check \
-       --model_name <YOUR QWEN2.5-1.5B PATH> \
-       --dataset_name yahma/alpaca-cleaned \
-       --trials 15 \
-       --seq_len 256 \
-       --chunk_size 128 \
-       --tolerances 5e-4 5e-4 \
-       --local_ranks 0 1 \
-       --cache_dir <YOUR DATASET CACHE DIR> \
-       --dtype fp32 \
-       --attn_impl mem_efficient
-    ```
 
 ## Performance Measurement
 
-- Torch SDPA [no-chunk, memory efficient attn, bf16]
+As our use of `torchtune 0.4.0` requires features provided by `torch 2.4.0`, which has support of `SDPA cuDNN attention`, here we consider using this faster (compared to `MEA`) attention kernel to measure performance.
 
-    ```
-    python -m benchmarks.chunked_peft.whole_peft_performance_measure \
-        --model_name <YOUR LLAMA-3.1-8B PATH> \
-        --dataset_name sordonia/flan-10k-flat \
-        --trials 30 \
-        --warmup 10 \
-        --seq_len 1024 \
-        --local_rank 0 \
-        --cache_dir <YOUR DATASET CACHE DIR> \
-        --attn_impl mem_efficient \
-        --dtype bf16 \
-        --seed 42 \
-        --res_folder results/mea_performance/
-    ```
+- Whole LORA fine-tuning, SDPA cuDNN attention, bf16
 
-- Torch SDPA [chunked, memory efficient attn, bf16]
-
-    ```
-    python -m benchmarks.chunked_peft.chunked_peft_performance_measure \
-        --model_name <YOUR LLAMA-3.1-8B PATH> \
-        --dataset_name sordonia/flan-10k-flat \
-        --trials 30 \
-        --warmup 10 \
-        --seq_len 1024 \
-        --chunk_size 128 \
-        --local_rank 0 \
-        --cache_dir <YOUR DATASET CACHE DIR> \
-        --attn_impl mem_efficient \
-        --dtype bf16 \
-        --seed 42 \
-        --res_folder results/mea_performance/ \
-        --show_chunk_time y
+    ```[shell]
+    torchrun --nnode=1 --nproc-per-node=2 \
+        -m benchmarks.chunked_peft.lora_ft_dist_whole \
+        --config benchmarks/chunked_peft/configs/llama2_13b_lora_dist_whole_performance.yaml \
+        output_dir=<YOUR OUTPUT FOLDER PATH> \
+        checkpoint_dir=<YOUR MODEL CKPT PATH> \
+        tokenizer.path=<YOUR TOKENIZER PATH> \
+        cache_dir=<YOUR DATASET CACHE PATH> \
+        max_steps_per_epoch=30 \
+        tokenizer.max_seq_len=1024 \
+        num_output_chunks=8 \
+        attn_impl=mem_efficient
     ```
 
-- Flash Attn [chunked, fp16] (requires `flash_attn` installed)
+- Chunked LORA fine-tuning, SDPA cuDNN attention, bf16
 
-    ```
-    python -m benchmarks.chunked_peft.chunked_peft_performance_measure \
-        --model_name <YOUR LLAMA-3.1-8B PATH> \
-        --dataset_name sordonia/flan-10k-flat \
-        --trials 30 \
-        --warmup 10 \
-        --seq_len 1024 \
-        --chunk_size 128 \
-        --local_rank 0 \
-        --cache_dir <YOUR DATASET CACHE DIR> \
-        --attn_impl flash_attention_2 \
-        --dtype fp16 \
-        --seed 42 \
-        --res_folder results/fa_performance/ \
-        --show_chunk_time y
+    ```[shell]
+    torchrun --nnode=1 --nproc-per-node=2 \
+        -m benchmarks.chunked_peft.lora_ft_dist_chunked \
+        --config benchmarks/chunked_peft/configs/llama2_13b_lora_dist_chunked_performance.yaml \
+        output_dir=<YOUR OUTPUT FOLDER PATH> \
+        checkpointer.checkpoint_dir=<YOUR MODEL CKPT PATH> \
+        tokenizer.path=<YOUR TOKENIZER PATH> \
+        dataset.cache_dir=<YOUR DATASET CACHE PATH> \
+        max_steps_per_epoch=30 \
+        tokenizer.max_seq_len=1024 \
+        chunk_size=128 \
+        attn_impl=mem_efficient
     ```
