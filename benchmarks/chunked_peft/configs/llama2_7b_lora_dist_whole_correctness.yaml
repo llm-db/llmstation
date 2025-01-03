@@ -66,6 +66,7 @@ gradient_accumulation_steps: 1  # Use to increase effective batch size
 compile: False  # torch.compile the model + loss, True increases speed + decreases memory
 debug_mode: 2   # [chunked peft] enable cuDNN determinism
 attn_impl: math # [chunked peft] SDPA math kernal for correctness verification
+warmup_steps: null # [chunked peft] add warmup steps for performance measurement
 
 # Logging
 metric_logger:

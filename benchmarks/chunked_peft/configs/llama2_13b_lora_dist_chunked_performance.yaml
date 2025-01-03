@@ -68,6 +68,7 @@ compile: False   # torch.compile the model + loss, True increases speed + decrea
 chunk_size: 128  # [chunked peft] chunk size for chunked peft
 debug_mode: null # [chunked peft] disable cuDNN determinism for better performance
 attn_impl: mem_efficient # [chunked peft] SDPA cuDNN kernal for correctness verification
+warmup_steps: 10 # [chunked peft] add warmup steps for performance measurement
 
 # Logging
 metric_logger:

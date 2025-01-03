@@ -42,7 +42,8 @@ from torchtune.training import DummyProfiler, PROFILER_KEY
 
 from tqdm import tqdm
 
-from benchmarks.chunked_peft.chunk_utils import ChunkCache, batch_to_device, set_sdpa_mode
+from benchmarks.chunked_peft.chunk_utils import set_sdpa_mode
+from benchmarks.chunked_peft.timer_utils import get_stat_str
 
 log = utils.get_logger("DEBUG")
 
@@ -143,7 +144,10 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
         _, rank = training.get_world_size_and_rank()
 
+
         set_sdpa_mode(attn_impl=cfg.attn_impl) # [chunked peft] set SDPA kernel
+        self.warmup_steps = cfg.warmup_steps   # [chunked peft] set warmup_steps
+
 
         # _is_rank_zero is used primarily for logging. In the future, the logger
         # should directly take care of this
@@ -762,7 +766,6 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
         torch.distributed.barrier()
 
-
     def train(self) -> None:
         """
         The core training loop.
@@ -779,6 +782,12 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         t0 = time.perf_counter()
         running_loss = 0
         num_tokens = 0
+
+
+        # [chunked peft] add forward & backward time listing
+        forward_timings: List[float] = []
+        total_timings: List[float] = []
+
 
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
@@ -835,7 +844,13 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
                 current_loss = self._loss_fn(logits, labels) * current_num_tokens
+
                 
+                # [chunked peft] add forward timing
+                if (idx + 1) % self._gradient_accumulation_steps == 0:
+                    forward_timings.append(time.perf_counter() - t0)
+
+
                 # free logits otherwise it peaks backward memory
                 del logits
 
@@ -867,6 +882,11 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     pbar.set_description(
                         f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
                     )
+
+
+                    # [chunked peft] add backward timing
+                    total_timings.append(time.perf_counter() - t0)
+
 
                     # Log per-step metrics
                     if (
@@ -913,8 +933,29 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     # Note that this is called within gradient accumulation block, hence
                     # will include multiple forward / backward passes if gradient accumulation > 1
                     self._profiler.step()
-    
-    
+
+            self.epochs_run += 1
+            self.save_checkpoint(epoch=curr_epoch)
+
+
+            # [chunked peft] print log string
+            if self.warmup_steps is not None:
+                log_str: str = get_stat_str(
+                    device=self._device,
+                    batch_size=self._dataloader.batch_size,
+                    warmup_steps=self.warmup_steps,
+                    forward_timings=forward_timings,
+                    total_timings=total_timings,
+                    fwd_chunk_timings=[],
+                    bwd_chunk_timings=[],
+                )
+                fname: str = f"whole_seqlen{self._tokenizer.max_seq_len}_{self._device}.txt"
+                with open(self._output_dir + "/" + fname, "a+") as fp:
+                    fp.write(log_str + '\n')
+
+
+        self._profiler.stop()
+
     def cleanup(self) -> None:
         if self._is_rank_zero:
             self._metric_logger.close()

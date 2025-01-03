@@ -50,6 +50,7 @@ from benchmarks.chunked_peft.chunk_utils import (
     fixed_cross_entropy,
     prepare_causal_attention_mask_with_cache_position,
 )
+from benchmarks.chunked_peft.timer_utils import get_stat_str
 
 log = utils.get_logger("DEBUG")
 
@@ -148,7 +149,10 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 "full fp16 training is not supported with this recipe. Please use bf16 or fp32 instead."
             )
 
+
         set_sdpa_mode(attn_impl=cfg.attn_impl) # [chunked peft] set SDPA kernel
+        self.warmup_steps = cfg.warmup_steps   # [chunked peft] set warmup_steps
+
 
         _, rank = training.get_world_size_and_rank()
 
@@ -772,7 +776,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
         torch.distributed.barrier()
 
-    def chunked_peft_forward(self, batch, chunk_size) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    def chunked_peft_forward(self, batch, chunk_size, fwd_chunk_timings) -> Tuple[List[torch.Tensor], torch.Tensor]:
         num_total_tokens: int = batch["tokens"].shape[1]
         num_processed_tokens: int = 0
         past_key_values = ChunkCache().to(device=self._device)
@@ -781,6 +785,9 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         ).sum().to(device=self._device) - 1
         losses: List[torch.nn.Module] = []
         labels = batch.pop("labels").to(self._device)
+
+        step_fwd_chunk_timings: List[float] = [ ]
+        t0 = time.perf_counter()
 
         while num_processed_tokens < num_total_tokens:
             num_cur_step: int = min(chunk_size, num_total_tokens-num_processed_tokens)
@@ -838,13 +845,23 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             losses.append(cur_loss)
             num_processed_tokens += num_cur_step
 
+            step_fwd_chunk_timings.append(time.perf_counter()-t0)
+            t0 = time.perf_counter()
+        
+        fwd_chunk_timings.append(step_fwd_chunk_timings)
+
         return losses, num_valid_tokens
 
 
-    def chunked_peft_backward(self, losses: List[torch.Tensor]) -> torch.Tensor:
+    def chunked_peft_backward(self, losses: List[torch.Tensor], bwd_chunk_timings: List[List[float]]) -> torch.Tensor:
+        step_bwd_chunk_timings: List[float] = [ ]
+        t0 = time.perf_counter()
         for loss in losses[::-1]:
             loss.backward(retain_graph=False)
             loss.detach()
+            step_bwd_chunk_timings.append(time.perf_counter()-t0)
+            t0 = time.perf_counter()
+        bwd_chunk_timings.append(step_bwd_chunk_timings)
         return sum(losses)
 
 
@@ -864,6 +881,12 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         t0 = time.perf_counter()
         running_loss = 0
         num_tokens = 0
+
+        # [chunked peft] add forward & backward time listing
+        forward_timings: List[float] = []
+        total_timings: List[float] = []
+        fwd_chunk_timings: List[List[float]] = []
+        bwd_chunk_timings: List[List[float]] = []
 
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
@@ -892,8 +915,15 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     torch.cuda.memory._record_memory_history()
 
                 # [chunked peft] chunked forward & backward
-                losses, current_num_tokens = self.chunked_peft_forward(batch, self.chunk_size)
-                current_loss = self.chunked_peft_backward(losses)
+                losses, current_num_tokens = self.chunked_peft_forward(
+                    batch, 
+                    self.chunk_size,
+                    fwd_chunk_timings,
+                )
+                if (idx + 1) % self._gradient_accumulation_steps == 0:
+                    forward_timings.append(time.perf_counter() - t0)
+                
+                current_loss = self.chunked_peft_backward(losses, bwd_chunk_timings)
                 
                 num_tokens += current_num_tokens
                 running_loss += current_loss
@@ -923,6 +953,9 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     pbar.set_description(
                         f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
                     )
+
+                    # [chunked peft] add backward timing
+                    total_timings.append(time.perf_counter() - t0)
 
                     # Log per-step metrics
                     if (
@@ -972,6 +1005,21 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
             self.epochs_run += 1
             self.save_checkpoint(epoch=curr_epoch)
+
+            # [chunked peft] print log string
+            if self.warmup_steps is not None:
+                log_str: str = get_stat_str(
+                    device=self._device,
+                    batch_size=self._dataloader.batch_size,
+                    warmup_steps=self.warmup_steps,
+                    forward_timings=forward_timings,
+                    total_timings=total_timings,
+                    fwd_chunk_timings=fwd_chunk_timings,
+                    bwd_chunk_timings=bwd_chunk_timings,
+                )
+                fname: str = f"chunk_seqlen{self._tokenizer.max_seq_len}_chunksize{self.chunk_size}_{self._device}.txt"
+                with open(self._output_dir + "/" + fname, "a+") as fp:
+                    fp.write(log_str + '\n')
 
         self._profiler.stop()
 

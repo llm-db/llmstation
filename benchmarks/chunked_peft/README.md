@@ -72,6 +72,7 @@ NOTE: As `torchtune` currently only support `bf16` and `fp32`,  considering nume
         tokenizer.path=<YOUR TOKENIZER PATH> \
         cache_dir=<YOUR DATASET CACHE PATH> \
         max_steps_per_epoch=30 \
+        warmup_steps=10 \
         tokenizer.max_seq_len=1024 \
         num_output_chunks=8 \
         attn_impl=mem_efficient
@@ -88,6 +89,7 @@ NOTE: As `torchtune` currently only support `bf16` and `fp32`,  considering nume
         tokenizer.path=<YOUR TOKENIZER PATH> \
         dataset.cache_dir=<YOUR DATASET CACHE PATH> \
         max_steps_per_epoch=30 \
+        warmup_steps=10 \
         tokenizer.max_seq_len=1024 \
         chunk_size=128 \
         attn_impl=mem_efficient
