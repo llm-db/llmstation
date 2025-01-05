@@ -794,14 +794,14 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             num_will_complete_tokens = num_processed_tokens + num_cur_step
             cache_position: torch.Tensor = torch.arange(
                 start=num_processed_tokens, end=num_will_complete_tokens
-            )[None,:].repeat((batch["tokens"].shape[0], 1)).to(device=self._device)
+            )[None,:].repeat((batch["tokens"].shape[0], 1))
             assert batch.get("mask", None) == None
             mask: torch.Tensor = prepare_causal_attention_mask_with_cache_position(
                 attention_mask=None,
                 sequence_length=num_cur_step,
                 target_length=num_will_complete_tokens,
                 dtype=self._dtype,
-                device=self._device,
+                device=cache_position.device,
                 cache_position=cache_position[0,:],
                 batch_size=batch["tokens"].shape[0],
             )
@@ -856,13 +856,14 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
     def chunked_peft_backward(self, losses: List[torch.Tensor], bwd_chunk_timings: List[List[float]]) -> torch.Tensor:
         step_bwd_chunk_timings: List[float] = [ ]
         t0 = time.perf_counter()
+        detached_losses: List[torch.Tensor] = [ ]
         for loss in losses[::-1]:
             loss.backward(retain_graph=False)
-            loss.detach()
+            detached_losses.append(loss.detach())
             step_bwd_chunk_timings.append(time.perf_counter()-t0)
             t0 = time.perf_counter()
         bwd_chunk_timings.append(step_bwd_chunk_timings)
-        return sum(losses)
+        return sum(detached_losses) # use detached loss tensor to avoid memory cost
 
 
     def train(self) -> None:
@@ -924,7 +925,8 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     forward_timings.append(time.perf_counter() - t0)
                 
                 current_loss = self.chunked_peft_backward(losses, bwd_chunk_timings)
-                
+                del losses # delete losses to free memory
+
                 num_tokens += current_num_tokens
                 running_loss += current_loss
 
