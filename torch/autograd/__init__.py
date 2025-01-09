@@ -8,7 +8,7 @@ As of now, we only support autograd for floating point :class:`Tensor` types (
 half, float, double and bfloat16) and complex :class:`Tensor` types (cfloat, cdouble).
 """
 import warnings
-from typing import Any, Callable, cast, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, cast, Generator, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -295,6 +295,69 @@ def backward(
         allow_unreachable=True,
         accumulate_grad=True,
     )
+
+
+def coro_backward(
+    tensors: _TensorOrTensors,
+    grad_tensors: Optional[_TensorOrTensors] = None,
+    retain_graph: Optional[bool] = None,
+    create_graph: bool = False,
+    grad_variables: Optional[_TensorOrTensors] = None,
+    inputs: Optional[_TensorOrTensorsOrGradEdge] = None,
+)  -> Generator[None, None, None]:
+    if torch._C._are_functorch_transforms_active():
+        raise RuntimeError(
+            "backward() called inside a functorch transform. This is not "
+            "supported, please use functorch.grad or functorch.vjp instead "
+            "or call backward() outside of functorch transforms."
+        )
+
+    if grad_variables is not None:
+        warnings.warn(
+            "`grad_variables` is deprecated. Use `grad_tensors` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if grad_tensors is None:
+            grad_tensors = grad_variables
+        else:
+            raise RuntimeError(
+                "`grad_tensors` and `grad_variables` (deprecated) "
+                "arguments both passed to `backward()`. Please only "
+                "use `grad_tensors`."
+            )
+    if inputs is not None and len(inputs) == 0:
+        raise RuntimeError("`inputs` argument to `backward()` cannot be empty.")
+
+    tensors = (tensors,) if isinstance(tensors, torch.Tensor) else tuple(tensors)
+    inputs = (
+        (inputs,)
+        if isinstance(inputs, (torch.Tensor, graph.GradientEdge))
+        else tuple(inputs)
+        if inputs is not None
+        else tuple()
+    )
+
+    grad_tensors_ = _tensor_or_tensors_to_tuple(grad_tensors, len(tensors))
+    grad_tensors_ = _make_grads(tensors, grad_tensors_, is_grads_batched=False)
+    if retain_graph is None:
+        retain_graph = create_graph
+
+    coro_pycapsule = Variable._execution_engine.init_owning_backward(
+        tensors,
+        grad_tensors_,
+        retain_graph,
+        create_graph,
+        inputs,
+        allow_unreachable=True,
+        accumulate_grad=True,
+    )
+
+    finished = False
+    while not finished:
+        finished = Variable._execution_engine.resume_owning_backward(coro_pycapsule)
+        yield
+    return
 
 
 def grad(

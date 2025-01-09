@@ -278,6 +278,51 @@ bool ReadyQueue::empty() const {
   return heap_.empty();
 }
 
+auto ReadyQueue::wait_owning() -> void {
+  std::unique_lock<std::mutex> lock(mutex_);
+  device_suspend.store(true);
+  not_empty_.notify_one();
+  while (device_suspend.load()) {
+    not_empty_.wait(lock);
+ }
+}
+
+auto ReadyQueue::wait_owning_after_push(NodeTask item, bool incrementOutstandingTasks) -> void {
+  {
+    // Lock mutex for writing to heap_
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (incrementOutstandingTasks) {
+      std::shared_ptr<GraphTask> graph_task = item.base_.lock();
+      TORCH_INTERNAL_ASSERT(graph_task, "GraphTask is no longer valid!");
+      ++graph_task->outstanding_tasks_;
+    }
+    heap_.push(std::move(item));
+  }
+  std::unique_lock<std::mutex> lock(mutex_);
+  device_suspend.store(true);
+  not_empty_.notify_one();
+  while (device_suspend.load()) {
+    not_empty_.wait(lock);
+  }
+}
+
+auto ReadyQueue::wait_device() -> utils::task<NodeTask> {
+  // Lock mutex for accesses to heap_
+  std::unique_lock<std::mutex> lock(mutex_);
+  while (heap_.empty()) {
+    device_suspend.store(false);
+    not_empty_.notify_one();
+    while (!device_suspend.load()) {
+      not_empty_.wait(lock);
+    }
+    co_await std::suspend_always{};
+  }
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+  auto task = std::move(const_cast<NodeTask&>(heap_.top()));
+  heap_.pop();
+  co_return task;
+}
+
 Engine::Engine()
     : max_recursion_depth_(MAX_DEPTH), non_reentrant_device_thread_count_(0) {}
 
@@ -385,6 +430,53 @@ void Engine::thread_init(
 
   std::shared_ptr<GraphTask> graph_task = nullptr;
   thread_main(graph_task);
+  if (should_increment) {
+    // Decrement the count during shutdown if we incremented earlier.
+    decrement_non_reentrant_thread_count();
+  }
+}
+
+void Engine::device_thread_init(
+    int device,
+    const std::shared_ptr<ReadyQueue>& ready_queue,
+    bool should_increment) {
+  // pthread_setname_np restricts the name to 16 characters including
+  // the null byte.
+  std::string thread_name = "pt_autograd_" + std::to_string(device);
+  c10::setThreadName(thread_name);
+
+  c10::set_terminate_handler();
+  if (should_increment) {
+    increment_non_reentrant_thread_count();
+  }
+
+  at::init_num_threads();
+
+  // Note [Allocating GPUs to autograd threads]
+  // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  // What's our strategy here?  Originally, the autograd engine was written
+  // with only CUDA in mind.  We allocate one thread to handle all CPU
+  // operations, and a thread per CUDA device.
+  //
+  // But what if we have OTHER devices?  There are two plausible
+  // strategies:
+  //
+  //  - We can allocate threads equal to max(num_cuda_devices, num_xla_devices,
+  //    ...) and colocate cuda device 0 with xla device 0
+  //  - We can allocate threads equal to sum(num_cuda_devices, num_xla_devices,
+  //    ...) keeping everyone separate.
+  //
+  // We don't have any good reason to prefer one or the other, so we've
+  // arbitrarily picked to colocate devices.  Maybe the other approach is
+  // better.
+  worker_device = device;
+
+  // initialize each device thread's thread local ready queue with the ready
+  // queue that is created before the thread initialization
+  init_local_ready_queue(ready_queue);
+
+  std::shared_ptr<GraphTask> graph_task = nullptr;
+  device_thread_main(graph_task);
   if (should_increment) {
     // Decrement the count during shutdown if we incremented earlier.
     decrement_non_reentrant_thread_count();
@@ -611,6 +703,207 @@ auto Engine::thread_main(const std::shared_ptr<GraphTask>& graph_task) -> void {
         ready_queue_by_index(local_graph_task->cpu_ready_queue_, base_owner)
             ->push(NodeTask(local_graph_task, nullptr, InputBuffer(0)));
       }
+    }
+  }
+}
+
+auto Engine::owning_thread_main(const std::shared_ptr<GraphTask>& graph_task) -> utils::task<void> {
+  // When graph_task is nullptr, this is a long running thread that processes
+  // tasks (ex: device threads). When graph_task is non-null (ex: reentrant
+  // backwards, user thread), this function is expected to exit once that
+  // graph_task complete.
+
+  // local_ready_queue should already been initialized when we get into
+  // thread_main
+  TORCH_INTERNAL_ASSERT(local_ready_queue != nullptr);
+  while (graph_task == nullptr || !graph_task->future_result_->completed()) {
+    // local_graph_task represents the graph_task we retrieve from the queue.
+    // The outer graph_task represents the overall graph_task we need to execute
+    // for reentrant execution.
+    std::shared_ptr<GraphTask> local_graph_task;
+    {
+      // Scope this block of execution since NodeTask is not needed after this
+      // block and can be deallocated (release any references to grad tensors
+      // as part of inputs_).
+      NodeTask task =  co_await local_ready_queue->wait_device();
+      // This will only work if the worker is running a non backward task
+      // TODO Needs to be fixed this to work in all cases
+      if (task.isShutdownTask_) {
+        C10_LOG_API_USAGE_ONCE("torch.autograd.thread_shutdown");
+        break;
+      }
+
+      local_graph_task = task.base_.lock();
+      if (!local_graph_task) {
+        // GraphTask for function is no longer valid, skipping further
+        // execution.
+        continue;
+      }
+
+      set_device(worker_device);
+
+      if (task.fn_ && !local_graph_task->has_error_.load()) {
+        // Set the ThreadLocalState before calling the function.
+        // NB: The ThreadLocalStateGuard doesn't set the grad_mode because
+        // GraphTask always saves ThreadLocalState without grad_mode.
+        at::ThreadLocalStateGuard tls_guard(local_graph_task->thread_locals_);
+        c10::WarningUtils::WarningHandlerGuard warnings_guard(
+            &local_graph_task->warning_handler_);
+
+        try {
+          // The guard sets the thread_local current_graph_task on construction
+          // and restores it on exit. The current_graph_task variable helps
+          // queue_callback() to find the target GraphTask to append final
+          // callbacks.
+          GraphTaskGuard guard(local_graph_task);
+          NodeGuard ndguard(task.fn_);
+          {
+            RECORD_FUNCTION(
+                c10::str(
+                    "autograd::engine::evaluate_function: ",
+                    task.fn_.get()->name()),
+                c10::ArrayRef<const c10::IValue>());
+            evaluate_function(
+                local_graph_task,
+                task.fn_.get(),
+                task.inputs_,
+                local_graph_task->cpu_ready_queue_);
+          }
+        } catch (std::exception& e) {
+          // See Note [ Persisting PyErr state across autograd engine threads ]
+          thread_on_exception(local_graph_task, task.fn_, e);
+        }
+      }
+    }
+
+    // Decrement the outstanding tasks.
+    --local_graph_task->outstanding_tasks_;
+
+    // Check if we've completed execution.
+    if (local_graph_task->completed()) {
+      local_graph_task->mark_as_completed_and_run_post_processing();
+
+      auto base_owner = local_graph_task->owner_;
+      // The current worker thread finish the graph_task, but the owning thread
+      // of the graph_task might be sleeping on pop() if it does not have work.
+      // So we need to send a dummy function task to the owning thread just to
+      // ensure that it's not sleeping, so that we can exit the thread_main.
+      // If it has work, it might see that graph_task->outstanding_tasks_ == 0
+      // before it gets to the task, but it's a no-op anyway.
+      //
+      // NB: This is not necessary if the current thread is the owning thread.
+      if (worker_device != base_owner) {
+        // Synchronize outstanding_tasks_ with queue mutex
+        std::atomic_thread_fence(std::memory_order_release);
+        ready_queue_by_index(local_graph_task->cpu_ready_queue_, base_owner)
+            ->push(NodeTask(local_graph_task, nullptr, InputBuffer(0)));
+      }
+    }
+  }
+  co_return;
+}
+
+auto Engine::device_thread_main(const std::shared_ptr<GraphTask>& graph_task) -> void {
+  // When graph_task is nullptr, this is a long running thread that processes
+  // tasks (ex: device threads). When graph_task is non-null (ex: reentrant
+  // backwards, user thread), this function is expected to exit once that
+  // graph_task complete.
+
+  // local_ready_queue should already been initialized when we get into
+  // thread_main
+  uint64_t finished_funcs = 0;
+  TORCH_INTERNAL_ASSERT(local_ready_queue != nullptr);
+  while (graph_task == nullptr || !graph_task->future_result_->completed()) {
+    // local_graph_task represents the graph_task we retrieve from the queue.
+    // The outer graph_task represents the overall graph_task we need to execute
+    // for reentrant execution.
+    std::shared_ptr<GraphTask> local_graph_task;
+    {
+      // Scope this block of execution since NodeTask is not needed after this
+      // block and can be deallocated (release any references to grad tensors
+      // as part of inputs_).
+      NodeTask task = local_ready_queue->pop();
+      // This will only work if the worker is running a non backward task
+      // TODO Needs to be fixed this to work in all cases
+      if (task.isShutdownTask_) {
+        C10_LOG_API_USAGE_ONCE("torch.autograd.thread_shutdown");
+        break;
+      }
+
+      local_graph_task = task.base_.lock();
+      if (!local_graph_task) {
+        // GraphTask for function is no longer valid, skipping further
+        // execution.
+        continue;
+      }
+
+      set_device(worker_device);
+
+      if (task.fn_ && !local_graph_task->has_error_.load()) {
+        // Set the ThreadLocalState before calling the function.
+        // NB: The ThreadLocalStateGuard doesn't set the grad_mode because
+        // GraphTask always saves ThreadLocalState without grad_mode.
+        at::ThreadLocalStateGuard tls_guard(local_graph_task->thread_locals_);
+        c10::WarningUtils::WarningHandlerGuard warnings_guard(
+            &local_graph_task->warning_handler_);
+
+        try {
+          // The guard sets the thread_local current_graph_task on construction
+          // and restores it on exit. The current_graph_task variable helps
+          // queue_callback() to find the target GraphTask to append final
+          // callbacks.
+          GraphTaskGuard guard(local_graph_task);
+          NodeGuard ndguard(task.fn_);
+          {
+            RECORD_FUNCTION(
+                c10::str(
+                    "autograd::engine::evaluate_function: ",
+                    task.fn_.get()->name()),
+                c10::ArrayRef<const c10::IValue>());
+            evaluate_function(
+                local_graph_task,
+                task.fn_.get(),
+                task.inputs_,
+                local_graph_task->cpu_ready_queue_);
+          }
+        } catch (std::exception& e) {
+          // See Note [ Persisting PyErr state across autograd engine threads ]
+          thread_on_exception(local_graph_task, task.fn_, e);
+        }
+      }
+    }
+
+    finished_funcs += 1;
+    // Decrement the outstanding tasks.
+    --local_graph_task->outstanding_tasks_;
+
+    // Check if we've completed execution.
+    if (local_graph_task->completed()) {
+      local_graph_task->mark_as_completed_and_run_post_processing();
+
+      auto base_owner = local_graph_task->owner_;
+      // The current worker thread finish the graph_task, but the owning thread
+      // of the graph_task might be sleeping on pop() if it does not have work.
+      // So we need to send a dummy function task to the owning thread just to
+      // ensure that it's not sleeping, so that we can exit the thread_main.
+      // If it has work, it might see that graph_task->outstanding_tasks_ == 0
+      // before it gets to the task, but it's a no-op anyway.
+      //
+      // NB: This is not necessary if the current thread is the owning thread.
+      if (worker_device != base_owner) {
+        // Synchronize outstanding_tasks_ with queue mutex
+        std::atomic_thread_fence(std::memory_order_release);
+        ready_queue_by_index(local_graph_task->cpu_ready_queue_, base_owner)
+            ->wait_owning_after_push(NodeTask(local_graph_task, nullptr, InputBuffer(0)));
+      }
+    } else {
+      auto base_owner = local_graph_task->owner_;
+      if (worker_device != base_owner)
+        if (finished_funcs % 128 == 0) {
+            std::atomic_thread_fence(std::memory_order_release);
+            ready_queue_by_index(local_graph_task->cpu_ready_queue_, base_owner)
+                ->wait_owning();
+        }
     }
   }
 }
@@ -1295,6 +1588,114 @@ auto Engine::execute(
   return fut->value().toTensorVector();
 }
 
+auto Engine::coro_execute(
+    const edge_list& root_edges,
+    const variable_list& inputs,
+    bool keep_graph,
+    bool create_graph,
+    bool accumulate_grad,
+    const edge_list& outputs) -> utils::task<variable_list> {
+  validate_outputs(
+      root_edges,
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+      const_cast<variable_list&>(inputs),
+      [](const std::string& msg) { return msg; });
+  if (accumulate_grad && create_graph) {
+    TORCH_WARN_ONCE(
+        "Using backward() with create_graph=True will create a reference cycle "
+        "between the parameter and its gradient which can cause a memory leak. "
+        "We recommend using autograd.grad when creating the graph to avoid this. "
+        "If you have to use this function, make sure to reset the .grad fields of "
+        "your parameters to None after use to break the cycle and avoid the leak.");
+  }
+
+  // Allows us to assert no other threads are in backwards
+  CompiledAutogradThreadingDebugCheck _thread_check;
+  auto compiled_autograd = the_compiled_autograd.load();
+  TORCH_INTERNAL_ASSERT(compiled_autograd != COMPILED_AUTOGRAD_POISON);
+
+  // accumulate_grad is true if and only if the frontend call was to
+  // backward(), not grad(). grad() returns the sum of the gradients
+  // w.r.t. the inputs and thus needs the inputs to be present.
+  TORCH_CHECK_VALUE(
+      accumulate_grad || !outputs.empty(), "grad requires non-empty inputs.");
+
+  // A fresh first time Engine::execute call should start on the CPU device,
+  // initialize a new thread local ready queue on CPU or reuse the existing one
+  // (if there is one allocated already, i.e. consecutive backward calls,
+  // re-entrant backward calls), then memoize the local_ready_queue in GraphTask
+  init_local_ready_queue();
+  bool not_reentrant_backward_call = worker_device == NO_DEVICE;
+
+  // Store root nodes so we can traverse through the graph later
+  // e.g., for get_current_graph_task_execution_order
+  c10::SmallVector<Node*, 4> temp_roots{root_edges.size()};
+  for (const auto i : c10::irange(root_edges.size())) {
+    temp_roots[i] = root_edges[i].function.get();
+  }
+
+  auto graph_task = std::make_shared<GraphTask>(
+      /* keep_graph */ keep_graph,
+      /* create_graph */ create_graph,
+      /* depth */ not_reentrant_backward_call ? 0 : total_depth + 1,
+      /* cpu_ready_queue */ local_ready_queue,
+      /* graph_roots */ std::move(temp_roots));
+
+  // If we receive a single root, skip creating extra root node
+  bool skip_dummy_node = root_edges.size() == 1 && compiled_autograd == nullptr;
+  auto graph_root = skip_dummy_node
+      ? root_edges.at(0).function
+      : std::make_shared<GraphRoot>(root_edges, inputs);
+
+  auto min_topo_nr = compute_min_topological_nr(outputs);
+  // Now compute the dependencies for all executable functions
+  compute_dependencies(graph_root.get(), *graph_task, min_topo_nr);
+
+  if (!outputs.empty()) {
+    graph_task->init_to_execute(
+        *graph_root, outputs, accumulate_grad, min_topo_nr);
+  }
+
+  if (compiled_autograd != nullptr) {
+    // see [Note: Compiled Autograd]
+    TORCH_CHECK(
+        !create_graph, "compiled_autograd does not support create_graph");
+    _thread_check.release();
+    TORCH_CHECK(
+        !AnomalyMode::is_enabled(),
+        "compiled_autograd does not support AnomalyMode")
+    co_return (*compiled_autograd)(
+        graph_root, *graph_task, accumulate_grad, outputs);
+  }
+
+  // Queue the root
+  if (skip_dummy_node) {
+    InputBuffer input_buffer(root_edges.at(0).function->num_inputs());
+    auto input = inputs.at(0);
+
+    const auto input_stream = InputMetadata(input).stream();
+    auto opt_next_stream = root_edges.at(0).function->stream();
+    input_buffer.add(
+        root_edges.at(0).input_nr,
+        std::move(input),
+        input_stream,
+        opt_next_stream);
+
+    co_await coro_execute_with_graph_task(
+        graph_task, std::move(graph_root), std::move(input_buffer));
+  } else {
+    execute_with_graph_task(
+        graph_task, std::move(graph_root), InputBuffer(variable_list()));
+  }
+  // Avoid a refcount bump for the Future, since we check for refcount in
+  // DistEngine (see TORCH_INTERNAL_ASSERT(futureGrads.use_count() == 1)
+  // in dist_engine.cpp).
+  auto& fut = graph_task->future_result_;
+  fut->wait();
+  graph_task->warning_handler_.replay_warnings();
+  co_return fut->value().toTensorVector();
+}
+
 void Engine::initialize_device_threads_pool() {
   TORCH_CHECK(
       !in_bad_autograd_fork,
@@ -1378,6 +1779,82 @@ c10::intrusive_ptr<at::ivalue::Future> Engine::execute_with_graph_task(
   // graph_task_exec_post_processing is done when the Future is marked as
   // completed in mark_as_completed_and_run_post_processing.
   return graph_task->future_result_;
+}
+
+utils::task<c10::intrusive_ptr<at::ivalue::Future>> Engine::coro_execute_with_graph_task(
+    const std::shared_ptr<GraphTask>& graph_task,
+    std::shared_ptr<Node> graph_root,
+    InputBuffer&& input_buffer) {
+  initialize_device_threads_pool();
+  // Lock mutex for GraphTask.
+  std::unique_lock<std::mutex> lock(graph_task->mutex_);
+
+  auto queue = ready_queue(graph_task->cpu_ready_queue_, input_buffer.device());
+
+  // worker_device == NO_DEVICE it's a CPU thread and it's trying to drive the
+  // autograd engine with corresponding GraphTask, and its NOT a re-entrant call
+  if (worker_device == NO_DEVICE) {
+    // We set the worker_device to CPU_DEVICE only if worker_device was
+    // previously NO_DEVICE. Setting it to CPU afterwards allow us to detect
+    // whether this is a re-entrant call or not.
+    set_device(CPU_DEVICE);
+
+    // set the graph_task owner to the current device
+    graph_task->owner_ = worker_device;
+
+    // Now that all the non-thread safe fields of the graph_task have been
+    // populated, we can enqueue it.
+    queue->push(
+        NodeTask(graph_task, std::move(graph_root), std::move(input_buffer)));
+
+    // The owning thread start to drive the engine execution for any CPU task
+    // that was just pushed or will be added later from other worker threads
+    lock.unlock();
+    co_await owning_thread_main(graph_task);
+    TORCH_INTERNAL_ASSERT(graph_task->future_result_->completed());
+    // reset the worker_device after the completion of the graph_task, this is
+    // so that the initial state of the engine remains the same across every
+    // backward() or grad() call, we don't need to reset local_ready_queue as we
+    // could possibly reuse it for new backward calls.
+    worker_device = NO_DEVICE;
+  } else {
+    // If worker_device is any devices (i.e. CPU, CUDA): this is a re-entrant
+    //    backward call from that device.
+    graph_task->owner_ = worker_device;
+
+    // Now that all the non-thread safe fields of the graph_task have been
+    // populated, we can enqueue it.
+    queue->push(
+        NodeTask(graph_task, std::move(graph_root), std::move(input_buffer)));
+
+    if (current_depth >= max_recursion_depth_) {
+      // See Note [Reentrant backwards]
+      // If reached the max depth, switch to a different thread
+      add_thread_pool_task(graph_task);
+    } else {
+      // Total depth needs to be updated only in this codepath, since it is
+      // not used in the block above (when we call add_thread_pool_task).
+      // In the codepath above, GraphTask.reentrant_depth_ is used to
+      // bootstrap total_depth in the other thread.
+      ++total_depth;
+
+      // Get back to work while we wait for our new graph_task to
+      // complete!
+      ++current_depth;
+      lock.unlock();
+      thread_main(graph_task);
+      --current_depth;
+      --total_depth;
+
+      // The graph task should have completed and the associated future should
+      // be marked completed as well since 'thread_main' above is a call
+      // blocking an autograd engine thread.
+      TORCH_INTERNAL_ASSERT(graph_task->future_result_->completed());
+    }
+  }
+  // graph_task_exec_post_processing is done when the Future is marked as
+  // completed in mark_as_completed_and_run_post_processing.
+  co_return graph_task->future_result_;
 }
 
 // note that when python is present, this base engine will be overriden

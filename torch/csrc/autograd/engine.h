@@ -13,6 +13,7 @@
 #include <torch/csrc/autograd/graph_task.h>
 #include <torch/csrc/autograd/input_buffer.h>
 #include <torch/csrc/autograd/saved_variable_hooks.h>
+#include <torch/csrc/autograd/utils/coro.h>
 #include <torch/csrc/autograd/utils/warnings.h>
 
 #include <c10/util/CallOnce.h>
@@ -104,6 +105,7 @@ struct ReadyQueue {
   std::condition_variable not_empty_;
   // To protect read and writes to heap_
   mutable std::mutex mutex_;
+  std::atomic_bool device_suspend{false};
 
   std::priority_queue<NodeTask, std::vector<NodeTask>, CompareNodeTaskTime>
       heap_;
@@ -116,6 +118,9 @@ struct ReadyQueue {
   void push(NodeTask item, bool incrementOutstandingTasks = true);
   void pushShutdownTask();
   NodeTask pop();
+  void wait_owning();
+  void wait_owning_after_push(NodeTask item, bool incrementOutstandingTasks = true);
+  utils::task<NodeTask> wait_device();
   bool empty() const;
   size_t size() const;
 };
@@ -152,6 +157,13 @@ struct TORCH_API Engine {
       bool create_graph,
       bool accumulate_grad,
       const edge_list& outputs = {});
+  virtual utils::task<variable_list> coro_execute(
+      const edge_list& roots,
+      const variable_list& inputs,
+      bool keep_graph,
+      bool create_graph,
+      bool accumulate_grad,
+      const edge_list& outputs = {});
 
   // Given a pre-populated GraphTask and GraphRoot, computes the backward pass
   // for the graph.
@@ -159,6 +171,10 @@ struct TORCH_API Engine {
   // NB: This API should only be used by internal autograd specific
   // machinery and shouldn't be exposed to users in anyway.
   virtual c10::intrusive_ptr<at::ivalue::Future> execute_with_graph_task(
+      const std::shared_ptr<GraphTask>& graph_task,
+      std::shared_ptr<Node> graph_root,
+      InputBuffer&& input_buffer);
+  virtual utils::task<c10::intrusive_ptr<at::ivalue::Future>> coro_execute_with_graph_task(
       const std::shared_ptr<GraphTask>& graph_task,
       std::shared_ptr<Node> graph_root,
       InputBuffer&& input_buffer);
@@ -201,6 +217,11 @@ struct TORCH_API Engine {
       const std::shared_ptr<ReadyQueue>& ready_queue,
       bool should_increment = true);
 
+  virtual void device_thread_init(
+      int device,
+      const std::shared_ptr<ReadyQueue>& ready_queue,
+      bool should_increment = true);
+
  protected:
   Engine();
   void compute_dependencies(Node* root, GraphTask& task, uint64_t min_topo_nr);
@@ -223,6 +244,8 @@ struct TORCH_API Engine {
   void increment_non_reentrant_thread_count();
   void decrement_non_reentrant_thread_count();
   virtual void thread_main(const std::shared_ptr<GraphTask>& task);
+  virtual utils::task<void> owning_thread_main(const std::shared_ptr<GraphTask>& task);
+  virtual void device_thread_main(const std::shared_ptr<GraphTask>& task);
   void reentrant_thread_init();
   void add_thread_pool_task(const std::weak_ptr<GraphTask>& graph_task);
 

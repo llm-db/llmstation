@@ -80,7 +80,7 @@ void PythonEngine::thread_init(
   pybind11::gil_scoped_acquire gil;
 #endif
   pybind11::gil_scoped_release no_gil;
-  Engine::thread_init(device, ready_queue, false);
+  Engine::device_thread_init(device, ready_queue, false);
 
   if (should_increment) {
     // Decrement the count during shutdown if we incremented earlier.
@@ -144,6 +144,29 @@ variable_list PythonEngine::execute(
   }
 }
 
+utils::task<variable_list> PythonEngine::coro_execute(
+    const edge_list& roots,
+    const variable_list& inputs,
+    bool keep_graph,
+    bool create_graph,
+    bool accumulate_grad,
+    const edge_list& outputs) {
+  TORCH_CHECK(
+      !PyGILState_Check(),
+      "The autograd engine was called while holding the GIL. If you are using the C++ "
+      "API, the autograd engine is an expensive operation that does not require the "
+      "GIL to be held so you should release it with 'pybind11::gil_scoped_release no_gil;'"
+      ". If you are not using the C++ API, please report a bug to the pytorch team.")
+  try {
+    auto coro_output = co_await Engine::coro_execute(
+        roots, inputs, keep_graph, create_graph, accumulate_grad, outputs);
+    co_return coro_output;
+  } catch (python_error& e) {
+    e.restore();
+    throw;
+  }
+}
+
 c10::intrusive_ptr<at::ivalue::Future> PythonEngine::execute_with_graph_task(
     const std::shared_ptr<GraphTask>& graph_task,
     std::shared_ptr<Node> graph_root,
@@ -160,11 +183,30 @@ c10::intrusive_ptr<at::ivalue::Future> PythonEngine::execute_with_graph_task(
     throw;
   }
 }
+
+utils::task<c10::intrusive_ptr<at::ivalue::Future>> PythonEngine::coro_execute_with_graph_task(
+    const std::shared_ptr<GraphTask>& graph_task,
+    std::shared_ptr<Node> graph_root,
+    InputBuffer&& input_buffer) {
+  try {
+    auto coro_output = co_await Engine::coro_execute_with_graph_task(
+        graph_task, std::move(graph_root), std::move(input_buffer));
+    co_return coro_output;
+  } catch (python_error& e) {
+    pybind11::gil_scoped_acquire gil;
+    if (!PyErr_Occurred()) {
+      // Set the error indicator only if it is not set already.
+      e.restore();
+    }
+    throw;
+  }
+}
 } // namespace python
 } // namespace autograd
 } // namespace torch
 
 PyObject* THPEngineClass = nullptr;
+static PyGILState_STATE FineInferGILState;
 
 // Implementation of torch._C._EngineBase.run_backward
 PyObject* THPEngine_run_backward(
@@ -385,6 +427,253 @@ PyObject* THPEngine_run_backward(
   END_HANDLE_TH_ERRORS
 }
 
+utils::task<PyObject*> coro_THPEngine_run_backward(
+    PyObject* self,
+    PyObject* args,
+    PyObject* kwargs) {
+  HANDLE_TH_ERRORS
+  PyObject* tensors = nullptr;
+  PyObject* grad_tensors = nullptr;
+  unsigned char keep_graph = 0;
+  unsigned char create_graph = 0;
+  PyObject* inputs = nullptr;
+  unsigned char allow_unreachable = 0;
+  unsigned char accumulate_grad =
+      0; // Indicate whether to accumulate grad into leaf Tensors or capture
+  constexpr const char* accepted_kwargs[] = {// NOLINT
+                                             "tensors",
+                                             "grad_tensors",
+                                             "keep_graph",
+                                             "create_graph",
+                                             "inputs",
+                                             "allow_unreachable",
+                                             "accumulate_grad",
+                                             nullptr};
+  if (!PyArg_ParseTupleAndKeywords(
+          args,
+          kwargs,
+          "OObb|Obb",
+          // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast,-warnings-as-errors)
+          const_cast<char**>(accepted_kwargs),
+          &tensors,
+          &grad_tensors,
+          &keep_graph,
+          &create_graph,
+          &inputs,
+          &allow_unreachable,
+          &accumulate_grad))
+    co_return nullptr;
+  TORCH_CHECK(
+      PyTuple_Check(tensors),
+      "tensors argument is expected to "
+      "be a tuple, but got ",
+      THPUtils_typename(tensors));
+  TORCH_CHECK(
+      PyTuple_Check(grad_tensors),
+      "grad_tensors argument is "
+      "expected to be a tuple, but got ",
+      THPUtils_typename(grad_tensors));
+
+  Py_ssize_t num_tensors = PyTuple_GET_SIZE(tensors);
+  Py_ssize_t num_gradients = PyTuple_GET_SIZE(grad_tensors);
+  TORCH_CHECK(
+      num_tensors == num_gradients,
+      "got ",
+      num_tensors,
+      " tensors and ",
+      num_gradients,
+      " gradients");
+
+  // The user either called autograd.backward(...) or autograd.grad(...) to get
+  // here
+  bool backward_api_called = accumulate_grad;
+  TORCH_CHECK(
+      !backward_api_called || at::impl::VmapMode::current_vmap_level() == 0,
+      "backward() called inside torch.vmap. This is not supported, "
+      "please call backward() outside torch.vmap or instead use "
+      "torch.autograd.grad inside torch.vmap");
+
+  edge_list roots;
+  roots.reserve(num_tensors);
+  variable_list grads;
+  grads.reserve(num_tensors);
+  for (const auto i : c10::irange(num_tensors)) {
+    PyObject* _tensor = PyTuple_GET_ITEM(tensors, i);
+    TORCH_CHECK(
+        THPVariable_Check(_tensor),
+        "element ",
+        i,
+        " of tensors tuple is not a Tensor");
+    const auto& variable = THPVariable_Unpack(_tensor);
+    TORCH_CHECK(
+        !isBatchedTensor(variable),
+        "torch.autograd.grad(outputs, inputs, grad_outputs) called inside ",
+        "torch.vmap. We do not support the case where any outputs are ",
+        "vmapped tensors (output ",
+        i,
+        " is being vmapped over). Please "
+        "call autograd.grad() outside torch.vmap or file a bug report "
+        "with your use case.")
+    auto gradient_edge = torch::autograd::impl::gradient_edge(variable);
+    TORCH_CHECK(
+        gradient_edge.function,
+        "element ",
+        i,
+        " of tensors does not require grad and does not have a grad_fn");
+    roots.push_back(std::move(gradient_edge));
+
+    PyObject* grad = PyTuple_GET_ITEM(grad_tensors, i);
+    if (THPVariable_Check(grad)) {
+      const Variable& grad_var = THPVariable_Unpack(grad);
+      if (grad_var.has_names()) {
+        TORCH_WARN(
+            "Autograd was passed a named grad tensor with dims ",
+            grad_var.names(),
+            ". Autograd does not yet support named tensor semantics, so all names ",
+            "will be ignored. In practice all computed gradients will still be correct "
+            "according to regular tensor semantics.");
+      }
+      grads.push_back(grad_var);
+    } else {
+      TORCH_CHECK(
+          grad == Py_None,
+          "element ",
+          i,
+          " of gradients tuple is not a Tensor or None");
+      TORCH_CHECK(
+          !variable.requires_grad(),
+          "element ",
+          i,
+          " of gradients tuple is None, but the corresponding Tensor requires grad");
+    }
+  }
+
+  std::vector<Edge> output_edges;
+  if (inputs != nullptr) {
+    TORCH_CHECK(
+        PyTuple_CheckExact(inputs), "inputs to run_backward must be a tuple");
+    int num_inputs = PyTuple_GET_SIZE(inputs);
+    output_edges.reserve(num_inputs);
+    for (const auto i : c10::irange(num_inputs)) {
+      PyObject* input = PyTuple_GET_ITEM(inputs, i);
+      if (THPVariable_Check(input)) {
+        const auto& tensor = THPVariable_Unpack(input);
+        TORCH_CHECK(
+            !isBatchedTensor(tensor),
+            "torch.autograd.grad(outputs, inputs, grad_outputs) called inside ",
+            "torch.vmap. We do not support the case where any inputs are ",
+            "vmapped tensors (input ",
+            i,
+            " is being vmapped over). Please "
+            "call autograd.grad() outside torch.vmap or file a bug report "
+            "with your use case.")
+        const auto output_nr = tensor.output_nr();
+        auto grad_fn = tensor.grad_fn();
+        if (!grad_fn) {
+          grad_fn = torch::autograd::impl::try_get_grad_accumulator(tensor);
+        }
+        if (accumulate_grad) {
+          tensor.retain_grad();
+        }
+        TORCH_CHECK(
+            tensor.requires_grad(),
+            "One of the differentiated Tensors does not require grad");
+        if (!grad_fn) {
+          // NOTE [ Autograd Unreachable Input ]
+          // Since input has no grad_accumulator, its guaranteed to be
+          // unreachable. We initialize an edge pointing to a non-nullptr Node
+          // so nodes in the graph (e.g., mul when an operand is scalar) that
+          // have edges pointing to nullptr don't get erroneously assigned
+          // `needed = True` in exec_info.
+          output_edges.emplace_back(std::make_shared<Identity>(), 0);
+        } else {
+          output_edges.emplace_back(grad_fn, output_nr);
+        }
+      } else if (PyObject_IsInstance(input, THPGradientEdgeClass)) {
+        auto node = PyTuple_GetItem(input, 0);
+        bool isTHPFunction = THPFunction_Check(node);
+        bool isTHPCppFunction = THPCppFunction_Check(node);
+        TORCH_CHECK(
+            isTHPFunction || isTHPCppFunction,
+            "GradientEdge first object must be an autograd.graph.Node "
+            "but got ",
+            THPUtils_typename(node));
+        std::shared_ptr<torch::autograd::Node> node_sp;
+        if (isTHPFunction) {
+          node_sp = ((THPFunction*)node)->cdata.lock();
+        } else {
+          node_sp = ((torch::autograd::THPCppFunction*)node)->cdata;
+        }
+
+        auto output_nr = THPUtils_unpackUInt32(PyTuple_GetItem(input, 1));
+        output_edges.emplace_back(node_sp, output_nr);
+      } else {
+        TORCH_CHECK(
+            false,
+            "all inputs have to be Tensors or GradientEdges, but got ",
+            THPUtils_typename(input));
+      }
+    }
+  }
+
+  variable_list outputs;
+  {
+    pybind11::gil_scoped_release no_gil;
+    auto& engine = python::PythonEngine::get_python_engine();
+    outputs = co_await engine.coro_execute(
+        roots, grads, keep_graph, create_graph, accumulate_grad, output_edges);
+  }
+
+  if (!backward_api_called && inputs != nullptr) {
+    int num_inputs = PyTuple_GET_SIZE(inputs);
+    THPObjectPtr py_outputs{PyTuple_New(num_inputs)};
+    if (!py_outputs)
+      co_return nullptr;
+    for (const auto i : c10::irange(num_inputs)) {
+      TORCH_CHECK(
+          allow_unreachable || outputs[i].defined(),
+          "One of the "
+          "differentiated Tensors appears to not have been used "
+          "in the graph. Set allow_unused=True if this is the "
+          "desired behavior.");
+      PyTuple_SET_ITEM(py_outputs.get(), i, THPVariable_Wrap(outputs[i]));
+    }
+    co_return py_outputs.release();
+  } else {
+    co_return Py_None;
+  }
+  coro_END_HANDLE_TH_ERRORS
+}
+
+PyObject* THPEngine_init_owning_backward(
+    PyObject* self,
+    PyObject* args,
+    PyObject* kwargs) {
+  HANDLE_TH_ERRORS
+  utils::task<PyObject*>* coro_ptr = new utils::task<PyObject*>(coro_THPEngine_run_backward(self=self, args=args, kwargs=kwargs));
+  coro_ptr->start();
+  FineInferGILState = PyGILState_Ensure();
+  return PyCapsule_New(coro_ptr, "coro_ptr", nullptr);
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject* THPEngine_resume_owning_backward(
+    PyObject* self,
+    PyObject* coro_pycapsule) {
+  HANDLE_TH_ERRORS
+  PyGILState_Release(FineInferGILState);
+  utils::task<PyObject*>* coro_ptr = (utils::task<PyObject*>*)PyCapsule_GetPointer(coro_pycapsule, "coro_ptr");
+  if (coro_ptr->done()) {
+    delete coro_ptr;
+    Py_RETURN_TRUE;
+  } else {
+    coro_ptr->resume();
+  }
+  FineInferGILState = PyGILState_Ensure();
+  Py_RETURN_FALSE;
+  END_HANDLE_TH_ERRORS
+}
+
 PyObject* THPEngine_queue_callback(PyObject* self, PyObject* _callback) {
   HANDLE_TH_ERRORS
   auto& engine = python::PythonEngine::get_python_engine();
@@ -440,6 +729,14 @@ static struct PyMethodDef THPEngine_methods[] = {
     {(char*)"run_backward",
      castPyCFunctionWithKeywords(THPEngine_run_backward),
      METH_VARARGS | METH_KEYWORDS,
+     nullptr},
+    {(char*)"init_owning_backward",
+     castPyCFunctionWithKeywords(THPEngine_init_owning_backward),
+     METH_VARARGS | METH_KEYWORDS,
+     nullptr},
+    {(char*)"resume_owning_backward",
+     THPEngine_resume_owning_backward,
+     METH_O,
      nullptr},
     {(char*)"queue_callback", THPEngine_queue_callback, METH_O, nullptr},
     {(char*)"is_checkpoint_valid",

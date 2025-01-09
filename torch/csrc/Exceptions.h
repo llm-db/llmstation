@@ -135,6 +135,20 @@ inline void PyErr_SetString(PyObject* type, const std::string& message) {
 
 #define END_HANDLE_TH_ERRORS END_HANDLE_TH_ERRORS_RET(nullptr)
 
+#define coro_END_HANDLE_TH_ERRORS_RET(retval)                            \
+  }                                                                 \
+  catch (...) {                                                     \
+    __enforce_warning_buffer.set_in_exception();                    \
+    throw;                                                          \
+  }                                                                 \
+  }                                                                 \
+  catch (const std::exception& e) {                                 \
+    torch::translate_exception_to_python(std::current_exception()); \
+    co_return retval;                                                  \
+  }
+
+#define coro_END_HANDLE_TH_ERRORS coro_END_HANDLE_TH_ERRORS_RET(nullptr)
+
 extern PyObject *THPException_FatalError, *THPException_LinAlgError,
     *THPException_OutOfMemoryError, *THPException_DistError,
     *THPException_DistBackendError, *THPException_DistNetworkError,

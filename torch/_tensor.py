@@ -6,7 +6,7 @@ import warnings
 from collections import OrderedDict
 from copy import deepcopy
 from numbers import Number
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Generator, Optional, Tuple, Union
 
 import torch
 import torch._C as _C
@@ -521,6 +521,26 @@ class Tensor(torch._C.TensorBase):
         torch.autograd.backward(
             self, gradient, retain_graph, create_graph, inputs=inputs
         )
+
+    def coro_backward(
+        self, gradient=None, retain_graph=None, create_graph=False, inputs=None
+    ) -> Generator[None, None, None]:
+        if has_torch_function_unary(self):
+            return handle_torch_function(
+                Tensor.backward,
+                (self,),
+                self,
+                gradient=gradient,
+                retain_graph=retain_graph,
+                create_graph=create_graph,
+                inputs=inputs,
+            )
+        coro_task = torch.autograd.coro_backward(
+            self, gradient, retain_graph, create_graph, inputs=inputs
+        )
+        for coro_output in coro_task:
+            yield
+        return
 
     def register_hook(self, hook):
         r"""Registers a backward hook.

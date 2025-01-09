@@ -27,8 +27,19 @@ struct PythonEngine : public Engine {
       bool create_graph,
       bool accumulate_grad,
       const edge_list& outputs = {}) override;
+  utils::task<variable_list> coro_execute(
+      const edge_list& roots,
+      const variable_list& inputs,
+      bool keep_graph,
+      bool create_graph,
+      bool accumulate_grad,
+      const edge_list& outputs = {}) override;
 
   c10::intrusive_ptr<at::ivalue::Future> execute_with_graph_task(
+      const std::shared_ptr<GraphTask>& graph_task,
+      std::shared_ptr<Node> graph_root,
+      InputBuffer&& input_buffer) override;
+  utils::task<c10::intrusive_ptr<at::ivalue::Future>> coro_execute_with_graph_task(
       const std::shared_ptr<GraphTask>& graph_task,
       std::shared_ptr<Node> graph_root,
       InputBuffer&& input_buffer) override;

@@ -967,6 +967,7 @@ endif()
 include(cmake/public/utils.cmake)
 if(NOT MSVC)
   string(APPEND CMAKE_CXX_FLAGS " -O2 -fPIC")
+  string(APPEND CMAKE_CXX_FLAGS " -fcoroutines")
   # Eigen fails to build with some versions, so convert this to a warning
   # Details at http://eigen.tuxfamily.org/bz/show_bug.cgi?id=1459
   string(APPEND CMAKE_CXX_FLAGS " -Wall")
