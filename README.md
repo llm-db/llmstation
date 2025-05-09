@@ -10,8 +10,8 @@ Hence, we mainly consider the `SDPA memory efficient attention`. For `torch 2.5.
 ## Environment Setups
 
 ```[shell]
-conda create -n FineInferChunkedDist python=3.12
-conda activate FineInferChunkedDist
+conda create -n ChunkedTrainingDist python=3.12
+conda activate ChunkedrainingDist
 pip install -r requirements.txt
 ```
 
