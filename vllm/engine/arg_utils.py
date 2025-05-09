@@ -179,6 +179,10 @@ class EngineArgs:
     override_neuron_config: Optional[Dict[str, Any]] = None
     mm_processor_kwargs: Optional[Dict[str, Any]] = None
     scheduling_policy: Literal["fcfs", "priority"] = "fcfs"
+    # Author: Yongjun
+    enable_fineinfer: bool = False
+    fineinfer_defer: float = 0.0
+    fineinfer_output: Optional[str] = None
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -823,6 +827,17 @@ class EngineArgs:
             'priority (lower value means earlier handling) and time of '
             'arrival deciding any ties).')
 
+        # Author: Yongjun
+        parser.add_argument('--enable-fineinfer',
+                            action='store_true',
+                            help='If True, enable handling of LoRA adapters fine-tuning.')
+        parser.add_argument('--fineinfer-defer',
+                            type=float,
+                            default=0,
+                            help='Delay in seconds before new prefill.')
+        parser.add_argument('--fineinfer-output',
+                            type=str,
+                            help='Directory to record FineInfer throughput.')
         return parser
 
     @classmethod
@@ -861,6 +876,10 @@ class EngineArgs:
             override_neuron_config=self.override_neuron_config,
             config_format=self.config_format,
             mm_processor_kwargs=self.mm_processor_kwargs,
+            # Author: Yongjun
+            enable_fineinfer=self.enable_fineinfer,
+            fineinfer_defer=self.fineinfer_defer,
+            fineinfer_output=self.fineinfer_output,
         )
 
     def create_load_config(self) -> LoadConfig:

@@ -182,6 +182,49 @@ class Worker(LocalOrDistributedWorkerBase):
     def load_model(self):
         self.model_runner.load_model()
 
+    # Author: Yongjun
+    from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+    def get_model(self) -> Union[torch.nn.Module, LRUCacheWorkerLoRAManager]:
+        if bool(self.lora_config):
+            return self.model_runner.lora_manager
+        return self.model_runner.model
+
+    def set_model(self, model: Union[torch.nn.Module, LRUCacheWorkerLoRAManager]) -> None:
+        if bool(self.lora_config):
+            self.model_runner.model = model._adapter_manager.model
+            self.model_runner.lora_manager = model
+        else:
+            self.model_runner.model = model
+
+    def del_model(self) -> None:
+        del self.model_runner.model
+        self.model_runner.model = None
+        if bool(self.lora_config):
+            del self.model_runner.lora_manager
+            self.model_runner.lora_manager = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def get_gpu_cache(self) -> Optional[List[List[torch.Tensor]]]:
+        return self.gpu_cache
+
+    def set_gpu_cache(self, gpu_cache: Optional[List[List[torch.Tensor]]]) -> None:
+        self.gpu_cache = gpu_cache
+        for ve in range(self.parallel_config.pipeline_parallel_size):
+            self.cache_engine[ve].gpu_cache = self.gpu_cache[ve]
+
+    def del_gpu_cache(self) -> None:
+        del self.gpu_cache
+        self.gpu_cache = None
+        for ve in range(self.parallel_config.pipeline_parallel_size):
+            del self.cache_engine[ve].gpu_cache
+            self.cache_engine[ve].gpu_cache = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def get_device(self) -> torch.device:
+        return self.device
+
     def save_sharded_state(
         self,
         path: str,
@@ -268,7 +311,9 @@ class Worker(LocalOrDistributedWorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         self._init_cache_engine()
-        self._warm_up_model()
+        # Author: Yongjun
+        if not self.model_config.enable_fineinfer or self.parallel_config.tensor_parallel_size == 1:
+            self._warm_up_model()
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None

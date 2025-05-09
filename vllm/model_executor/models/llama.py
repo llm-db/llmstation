@@ -55,6 +55,15 @@ from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers)
 
+# Author: Yongjun
+import math
+import torch.nn.functional as F
+from typing import Generator
+from vllm.distributed import (differentiable_all_gather,
+                              differentiable_identity,
+                              differentiable_all_reduce_sum)
+from vllm.lora.layers import MergedQKVParallelLinearWithLora
+
 
 class LlamaMLP(nn.Module):
 
@@ -254,6 +263,7 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states,
                                        kv_cache=kv_cache,
@@ -316,6 +326,8 @@ class LlamaModel(nn.Module):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
+        # Author: Yongjun
+        self.make_empty_intermediate_tensors = None
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -544,6 +556,8 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.lm_head = PPMissingLayer()
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+        # Author: Yongjun
+        self.make_empty_intermediate_tensors = None
 
     def forward(
         self,
@@ -615,3 +629,247 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                 name = name.replace(item, mapping[item])
 
         return name, loaded_weight
+
+    # Author: Yongjun
+    def add_lora_train(
+        self,
+        device: torch.device,
+    ) -> None:
+        for name, param in self.named_parameters():
+            param.requires_grad_(False)
+
+        for name, module in self.named_modules():
+            if name.endswith("qkv_proj"):
+                torch.manual_seed(0)
+                module.lora_a_train_q_proj = torch.nn.Parameter(
+                    torch.empty(
+                        module.lora_config.max_lora_rank,
+                        module.input_size,
+                        device=device,
+                    ),
+                    requires_grad=True,
+                )
+                torch.nn.init.kaiming_uniform_(module.lora_a_train_q_proj, a=math.sqrt(5))
+                module.lora_b_train_q_proj = torch.nn.Parameter(
+                    torch.zeros(
+                        module.q_proj_shard_size,
+                        module.lora_config.max_lora_rank,
+                        device=device,
+                    ),
+                    requires_grad=True,
+                )
+                module.lora_a_train_k_proj = torch.nn.Parameter(
+                    torch.empty(
+                        module.lora_config.max_lora_rank,
+                        module.input_size,
+                        device=device,
+                    ),
+                    requires_grad=True,
+                )
+                torch.nn.init.kaiming_uniform_(module.lora_a_train_k_proj, a=math.sqrt(5))
+                module.lora_b_train_k_proj = torch.nn.Parameter(
+                    torch.zeros(
+                        module.kv_proj_shard_size,
+                        module.lora_config.max_lora_rank,
+                        device=device,
+                    ),
+                    requires_grad=True,
+                )
+                module.lora_a_train_v_proj = torch.nn.Parameter(
+                    torch.empty(
+                        module.lora_config.max_lora_rank,
+                        module.input_size,
+                        device=device,
+                    ),
+                    requires_grad=True,
+                )
+                torch.nn.init.kaiming_uniform_(module.lora_a_train_v_proj, a=math.sqrt(5))
+                module.lora_b_train_v_proj = torch.nn.Parameter(
+                    torch.zeros(
+                        module.kv_proj_shard_size,
+                        module.lora_config.max_lora_rank,
+                        device=device,
+                    ),
+                    requires_grad=True,
+                )
+
+    def unfused_MergedQKVParallelLinearWithLora(
+        self,
+        input_: torch.Tensor,
+        lora_layer: MergedQKVParallelLinearWithLora,
+    ) -> torch.Tensor:
+        # Matrix multiply.
+        query_states = F.linear(
+            input_, lora_layer.base_layer.weight[: lora_layer.q_proj_shard_size]
+        )
+        key_states = F.linear(
+            input_,
+            lora_layer.base_layer.weight[
+                lora_layer.q_proj_shard_size : lora_layer.q_proj_shard_size
+                + lora_layer.kv_proj_shard_size
+            ],
+        )
+        value_states = F.linear(
+            input_,
+            lora_layer.base_layer.weight[
+                lora_layer.q_proj_shard_size + lora_layer.kv_proj_shard_size :
+            ],
+        )
+
+        lora_alpha: int = 32
+        scaling = lora_alpha / lora_layer.lora_config.max_lora_rank
+
+        output_dtype = query_states.dtype
+        lora_A = lora_layer.lora_a_train_q_proj
+        lora_B = lora_layer.lora_b_train_q_proj
+        input_ = input_.to(lora_A.dtype)
+        after_A = F.linear(input_, lora_A)
+        query_states += F.linear(after_A, lora_B) * scaling
+        query_states = query_states.to(output_dtype)
+
+        output_dtype = key_states.dtype
+        lora_A = lora_layer.lora_a_train_k_proj
+        lora_B = lora_layer.lora_b_train_k_proj
+        input_ = input_.to(lora_A.dtype)
+        after_A = F.linear(input_, lora_A)
+        key_states += F.linear(after_A, lora_B) * scaling
+        key_states = key_states.to(output_dtype)
+
+        output_dtype = value_states.dtype
+        lora_A = lora_layer.lora_a_train_v_proj
+        lora_B = lora_layer.lora_b_train_v_proj
+        input_ = input_.to(lora_A.dtype)
+        after_A = F.linear(input_, lora_A)
+        value_states += F.linear(after_A, lora_B) * scaling
+        value_states = value_states.to(output_dtype)
+        return query_states, key_states, value_states
+
+    def repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+        num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+        """
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+    def unfused_forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Generator[Union[torch.Tensor, IntermediateTensors], None, None]:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                # no lora
+                hidden_states = self.model.embed_tokens.base_layer(input_ids)
+            residual = None
+        else:
+            raise NotImplementedError
+
+        bsz, q_len = input_ids.size()
+        if positions is None:
+            positions = torch.arange(0, q_len, dtype=torch.long, device=torch.cuda.current_device())
+            positions = positions.unsqueeze(0)
+
+        from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+        attention_mask = _prepare_4d_causal_attention_mask(
+            attention_mask = attention_mask,
+            input_shape = (bsz, q_len),
+            inputs_embeds = hidden_states,
+            past_key_values_length = 0,
+        )
+
+        for i in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[i]
+
+            # Self Attention
+            residual = hidden_states
+            hidden_states = layer.input_layernorm.forward_native(hidden_states)
+
+            hidden_states = differentiable_identity(hidden_states)
+            q, k, v = self.unfused_MergedQKVParallelLinearWithLora(hidden_states, layer.self_attn.qkv_proj)
+
+            # Naive attention
+            # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
+            q = q.view(bsz, q_len, layer.self_attn.num_heads, layer.self_attn.head_dim).transpose(1, 2)
+            k = k.view(bsz, q_len, layer.self_attn.num_kv_heads, layer.self_attn.head_dim).transpose(1, 2)
+            v = v.view(bsz, q_len, layer.self_attn.num_kv_heads, layer.self_attn.head_dim).transpose(1, 2)
+
+            from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, LlamaRotaryEmbedding
+            hf_rotary_emb = LlamaRotaryEmbedding(config=self.model.config).to(torch.cuda.current_device())
+            cos, sin = hf_rotary_emb(v, positions)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+            num_key_value_groups = layer.self_attn.num_heads // layer.self_attn.num_kv_heads
+            k = self.repeat_kv(k, num_key_value_groups)
+            v = self.repeat_kv(v, num_key_value_groups)
+            import math
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(layer.self_attn.head_dim)
+
+            if attention_mask is not None:  # no matter the length, we just slice it
+                causal_mask = attention_mask[:, :, :, : k.shape[-2]]
+                attn_weights = attn_weights + causal_mask
+
+            # upcast attention to fp32
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_weights = F.dropout(attn_weights, p=0.0, training=False)
+            attn_output = torch.matmul(attn_weights, v)
+            if attn_output.size() != (bsz, layer.self_attn.num_heads, q_len, layer.self_attn.head_dim):
+                raise ValueError(
+                    f"`attn_output` should be of size {(bsz, layer.self_attn.num_heads, q_len, layer.self_attn.head_dim)}, but is"
+                    f" {attn_output.size()}"
+                )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, -1)
+
+            hidden_states = layer.self_attn.o_proj.base_layer.quant_method.apply(
+                layer.self_attn.o_proj.base_layer, attn_output
+            )
+            hidden_states = differentiable_all_reduce_sum(hidden_states)
+            hidden_states = residual + hidden_states
+
+            # Fully Connected
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm.forward_native(hidden_states)
+            # no lora
+            hidden_states = differentiable_identity(hidden_states)
+            gate_hidden_states = F.linear(
+                hidden_states,
+                layer.mlp.gate_up_proj.base_layer.weight[
+                    : layer.mlp.gate_up_proj.base_layer.output_partition_sizes[0]
+                ],
+            )
+            up_hidden_states = F.linear(
+                hidden_states,
+                layer.mlp.gate_up_proj.base_layer.weight[
+                    layer.mlp.gate_up_proj.base_layer.output_partition_sizes[0] :
+                ],
+            )
+            hidden_states = F.silu(gate_hidden_states) * up_hidden_states
+            hidden_states = layer.mlp.down_proj.base_layer.quant_method.apply(
+                layer.mlp.down_proj.base_layer, hidden_states
+            )
+            hidden_states = differentiable_all_reduce_sum(hidden_states)
+            hidden_states = residual + hidden_states
+
+            yield
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({
+                "hidden_states": hidden_states,
+                "residual": residual
+            })
+
+        hidden_states = self.model.norm.forward_native(hidden_states)
+        logits = F.linear(hidden_states, self.lm_head.weight).float()
+        if self.lm_head.tp_size > 1:
+            logits = differentiable_all_gather(logits)
+        logits = logits[:, :, : self.model.config.vocab_size]
+
+        yield logits

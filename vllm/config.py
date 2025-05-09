@@ -133,7 +133,11 @@ class ModelConfig:
                  use_async_output_proc: bool = True,
                  override_neuron_config: Optional[Dict[str, Any]] = None,
                  config_format: ConfigFormat = ConfigFormat.AUTO,
-                 mm_processor_kwargs: Optional[Dict[str, Any]] = None) -> None:
+                 mm_processor_kwargs: Optional[Dict[str, Any]] = None,
+                 # Author: Yongjun
+                 enable_fineinfer: Optional[bool] = None,
+                 fineinfer_defer: Optional[float] = None,
+                 fineinfer_output: Optional[str] = None,) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.tokenizer_mode = tokenizer_mode
@@ -205,6 +209,10 @@ class ModelConfig:
         self._verify_quantization()
         self._verify_cuda_graph()
         self._verify_bnb_config()
+        # Author: Yongjun
+        self.enable_fineinfer = enable_fineinfer
+        self.fineinfer_defer = fineinfer_defer
+        self.fineinfer_output = fineinfer_output
 
     def _init_multimodal_config(
         self, limit_mm_per_prompt: Optional[Mapping[str, int]]

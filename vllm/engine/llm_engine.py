@@ -474,6 +474,13 @@ class LLMEngine:
                 ),
             ))
 
+        # Author: Yongjun
+        if self.model_config.enable_fineinfer and bool(self.lora_config):
+            if self.parallel_config.tensor_parallel_size > 1:
+                self._initialize_fineinfer()
+            _add_finetune_request(self, self.model_config.tokenizer,
+                                  self.load_config.download_dir, self.model_config.fineinfer_output)
+
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
 
@@ -1383,6 +1390,26 @@ class LLMEngine:
                 execute_model_req.async_callback = self.async_callbacks[
                     virtual_engine]
 
+            # Author: Yongjun
+            from vllm.worker.model_runner_base import ModelRunnerInputBase
+            if self.model_config.enable_fineinfer and bool(self.lora_config):
+                model_input: ModelRunnerInputBase = (
+                    self.model_executor.driver_worker.model_runner.prepare_model_input(
+                        execute_model_req.seq_group_metadata_list,
+                        execute_model_req.virtual_engine,
+                        execute_model_req.finished_requests_ids))
+
+                if scheduler_outputs.running_queue_size == 1:
+                    if model_input.attn_metadata.prefill_metadata is not None:
+                        time.sleep(self.model_config.fineinfer_defer)
+
+                for task_queue in self.task_queues:
+                    task_queue.put_nowait(True)
+
+            if self.model_config.enable_fineinfer:
+                while self.is_finetuning:
+                    time.sleep(0.001)
+
             outputs = self.model_executor.execute_model(
                 execute_model_req=execute_model_req)
 
@@ -1456,6 +1483,9 @@ class LLMEngine:
             # queued control plane messages, such as add/remove lora adapters.
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
+
+            for task_queue in self.task_queues:
+                task_queue.put_nowait(False)
 
         return ctx.request_outputs
 
@@ -1932,3 +1962,268 @@ class LLMEngine:
                 sampling_params.logits_processors.extend(logits_processors)
 
         return sampling_params
+
+    # Author: Yongjun
+    def _initialize_fineinfer(self) -> None:
+        import copy
+        enable_lora = bool(self.lora_config)
+        self.cloned_models = []
+        self.cloned_gpu_cache = []
+        for remote_worker in self.model_executor.workers:
+            remote_worker_device = remote_worker.execute_method('get_device').get()
+            remote_worker_model = remote_worker.execute_method('get_model').get()
+            if enable_lora:
+                remote_worker_model._adapter_manager.model.to('cpu')
+            else:
+                remote_worker_model.to('cpu')
+            cloned_model = copy.deepcopy(remote_worker_model)
+            remote_worker.execute_method('del_model').get()
+            del remote_worker_model
+            if enable_lora:
+                cloned_model._adapter_manager.model.to(remote_worker_device)
+            else:
+                cloned_model.to(remote_worker_device)
+            remote_worker.execute_method('set_model', cloned_model).get()
+            self.cloned_models.append(cloned_model)
+
+            remote_gpu_cache = remote_worker.execute_method('get_gpu_cache').get()
+            for kv_cache in remote_gpu_cache:
+                for layer_idx in range(len(kv_cache)):
+                    kv_cache[layer_idx] = kv_cache[layer_idx].to('cpu')
+            cloned_gpu_cache = copy.deepcopy(remote_gpu_cache)
+            remote_worker.execute_method('del_gpu_cache').get()
+            del remote_gpu_cache
+            for kv_cache in cloned_gpu_cache:
+                for layer_idx in range(len(kv_cache)):
+                    kv_cache[layer_idx] = kv_cache[layer_idx].to(remote_worker_device)
+            remote_worker.execute_method('set_gpu_cache', cloned_gpu_cache).get()
+            self.cloned_gpu_cache.append(cloned_gpu_cache)
+        self.model_executor._run_workers("_warm_up_model")
+
+
+import datasets
+import itertools
+import torch.multiprocessing as mp
+from transformers import (AutoTokenizer,
+                          DataCollatorForLanguageModeling,
+                          PreTrainedTokenizerBase)
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.worker.worker import init_worker_distributed_environment
+
+
+def prepare_alpaca(
+    sample_raw,
+    tokenizer: PreTrainedTokenizerBase,
+    seq_len: int,
+):
+    template = {
+        "description": "A shorter template to experiment with.",
+        "prompt_input": "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n",
+        "prompt_no_input": "### Instruction:\n{instruction}\n\n### Response:\n",
+        "response_split": "### Response:"
+    }
+    if len(sample_raw["input"]):
+        sample_text = template["prompt_input"].format(
+            instruction=sample_raw["instruction"], input=sample_raw["input"]
+        )
+    else:
+        sample_text = template["prompt_no_input"].format(
+            instruction=sample_raw["instruction"]
+        )
+    if len(sample_raw["output"]):
+        sample_text += sample_raw["output"]
+    sample_tokens = tokenizer(sample_text, padding='max_length', truncation=True, max_length=seq_len)
+    return sample_tokens
+
+def finetune(
+    model_or_manager: Union[torch.nn.Module, LRUCacheWorkerLoRAManager],
+    gpu_cache: List[List[torch.Tensor]],
+    parallel_config: ParallelConfig,
+    tokenizer: str,
+    cache_dir: str,
+    fineinfer_output: str,
+    rank: int,
+    world_size: int,
+    task_queue: mp.Queue,
+    is_finetuning: Optional[torch.Tensor] = None,
+) -> None:
+    assert torch.distributed.is_initialized() == False
+    torch.cuda.set_device(rank)
+    init_worker_distributed_environment(
+        parallel_config = parallel_config,
+        rank = rank,
+        distributed_init_method = "tcp://127.0.0.1:28765",
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer, padding_side='left', cache_dir=cache_dir)
+    tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
+
+    dataset = datasets.load_dataset(
+        "yahma/alpaca-cleaned",
+        cache_dir = cache_dir,
+    )
+    dataset = dataset.map(
+        lambda sample_raw: prepare_alpaca(sample_raw, tokenizer, 500),
+        remove_columns=dataset["train"].column_names,
+    )
+    dataloader = torch.utils.data.DataLoader(
+        dataset["train"],
+        shuffle=False,
+        collate_fn=DataCollatorForLanguageModeling(tokenizer, mlm=False),
+        batch_size=1,
+        pin_memory=False,
+    )
+    dataloader_iter = itertools.cycle(iter(dataloader))
+
+    if model_or_manager.lora_config:
+        model = model_or_manager._adapter_manager.model
+    else:
+        model = model_or_manager
+
+    model.add_lora_train(device=torch.cuda.current_device())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    forward_time = 0
+    finetune_time = 0
+    consumed_finetune_samples = 0
+    unfinished_requests = False
+    while True:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_forward_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+
+        if not task_queue.empty():
+            unfinished_requests = task_queue.get()
+        if unfinished_requests:
+            time.sleep(0.001)
+            end_forward_event.record()
+            end_event.record()
+            torch.cuda.synchronize()
+            forward_time += start_event.elapsed_time(end_forward_event) / 1e3
+            finetune_time += start_event.elapsed_time(end_event) / 1e3
+            continue
+
+        if rank == 0:
+            is_finetuning.fill_(True)
+
+
+        sample_tokens = next(dataloader_iter)
+        sample_tokens.to(torch.cuda.current_device())
+        input_ids = sample_tokens["input_ids"]
+        attention_mask = sample_tokens["attention_mask"]
+        labels = sample_tokens["labels"]
+
+        finetune_task = model.unfused_forward(
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            positions = None,
+        )
+
+        for finetune_output in finetune_task:
+            if finetune_output is not None:
+                logits = finetune_output
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss_fct = torch.nn.CrossEntropyLoss()
+        shift_logits = shift_logits.view(-1, model.config.vocab_size)
+        shift_labels = shift_labels.view(-1)
+        loss = loss_fct(shift_logits, shift_labels)
+
+        end_forward_event.record()
+        torch.cuda.synchronize()
+
+        """
+        # When the inference request rate is high,
+        # pausing PEFT after the forward pass can improve the performance of FineInfer
+        if rank == 0:
+            is_finetuning.fill_(False)
+
+        time.sleep(0.005)
+        unfinished_requests = False
+        if not task_queue.empty():
+            unfinished_requests = task_queue.get()
+        while unfinished_requests:
+            time.sleep(0.001)
+            if not task_queue.empty():
+                unfinished_requests = task_queue.get()
+
+        if rank == 0:
+            is_finetuning.fill_(True)
+        """
+
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if rank == 0:
+            is_finetuning.fill_(False)
+
+        end_event.record()
+        torch.cuda.synchronize()
+        forward_time += start_event.elapsed_time(end_forward_event) / 1e3
+        finetune_time += start_event.elapsed_time(end_event) / 1e3
+
+        consumed_finetune_samples += 1
+        if rank == 0 and finetune_time > 10.0:
+            import os
+            fineinfer_log = fineinfer_output + '/fineinfer.log'
+            mode = 'a' if os.path.exists(fineinfer_log) else 'w'
+            with open(fineinfer_log, mode, encoding='utf-8') as f:
+                print(
+                    "Avg tps(samples/s) forward: %.2f, backward: %.2f, finetune: %.2f, Duration(s): %.2f"  % (
+                        consumed_finetune_samples / forward_time,
+                        consumed_finetune_samples / (finetune_time - forward_time),
+                        consumed_finetune_samples / finetune_time,
+                        finetune_time,
+                    ),
+                    file=f
+                )
+            forward_time = 0
+            finetune_time = 0
+            consumed_finetune_samples = 0
+
+def _add_finetune_request(
+    llm_engine: LLMEngine,
+    tokenizer: str,
+    download_dir: str,
+    fineinfer_output: str,
+) -> None:
+    enable_lora = bool(llm_engine.lora_config)
+    world_size = get_tensor_model_parallel_world_size()
+    llm_engine.task_queues = [mp.Queue() for _ in range(world_size)]
+    llm_engine.is_finetuning = torch.tensor(True, device=torch.cuda.current_device(), dtype=torch.bool)
+    processes = []
+    for rank in range(world_size):
+        is_finetuning = None
+        if rank:
+            cloned_model = llm_engine.cloned_models[rank - 1]
+            cloned_gpu_cache = llm_engine.cloned_gpu_cache[rank - 1]
+        else:
+            if enable_lora:
+                cloned_model = llm_engine.model_executor.driver_worker.model_runner.lora_manager
+            else:
+                cloned_model = llm_engine.model_executor.driver_worker.model_runner.model
+            cloned_gpu_cache = llm_engine.model_executor.driver_worker.gpu_cache
+            is_finetuning = llm_engine.is_finetuning
+
+        p = mp.Process(
+            target=finetune,
+            args=(cloned_model,
+                  cloned_gpu_cache,
+                  llm_engine.model_executor.driver_worker.parallel_config,
+                  tokenizer,
+                  download_dir,
+                  fineinfer_output,
+                  rank,
+                  world_size,
+                  llm_engine.task_queues[rank],
+                  is_finetuning,
+            ),
+        )
+        p.daemon = True
+        processes.append(p)
+    for p in processes:
+        p.start()
