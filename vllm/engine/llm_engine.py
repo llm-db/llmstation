@@ -474,6 +474,15 @@ class LLMEngine:
                 ),
             ))
 
+        # Author: Yongjun
+        if self.model_config.enable_lms and bool(self.lora_config):
+            if self.parallel_config.tensor_parallel_size > 1:
+                self._initialize_lms()
+            _add_finetune_request(self, self.model_config.tokenizer, self.load_config.download_dir,
+                                  self.model_config.lms_forward_tasklets, self.model_config.lms_forward_wait,
+                                  self.model_config.lms_backward_tasklets, self.model_config.lms_backward_wait,
+                                  self.model_config.lms_output)
+
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
 
@@ -1383,8 +1392,31 @@ class LLMEngine:
                 execute_model_req.async_callback = self.async_callbacks[
                     virtual_engine]
 
-            outputs = self.model_executor.execute_model(
-                execute_model_req=execute_model_req)
+            # Author: Yongjun
+            from vllm.worker.model_runner_base import ModelRunnerInputBase
+            from vllm.worker.worker import WorkerInput
+            fused = False
+            outputs = None
+            if self.model_config.enable_lms and bool(self.lora_config):
+                worker_input: WorkerInput = self.model_executor.driver_worker.prepare_worker_input(
+                    execute_model_req=execute_model_req)
+                model_input: ModelRunnerInputBase = (
+                    self.model_executor.driver_worker.model_runner.prepare_model_input(
+                        execute_model_req.seq_group_metadata_list,
+                        execute_model_req.virtual_engine,
+                        execute_model_req.finished_requests_ids))
+
+                if model_input.attn_metadata.prefill_metadata is not None:
+                    fused = False
+
+                for task_queue in self.task_queues:
+                    task_queue.put_nowait((fused, model_input, worker_input))
+
+            if self.model_config.enable_lms and fused:
+                outputs = self.result_queue.get()
+            if outputs is None:
+                outputs = self.model_executor.execute_model(
+                    execute_model_req=execute_model_req)
 
             # We need to do this here so that last step's sampled_token_ids can
             # be passed to the next iteration for PP.
@@ -1932,3 +1964,434 @@ class LLMEngine:
                 sampling_params.logits_processors.extend(logits_processors)
 
         return sampling_params
+
+    # Author: Yongjun
+    def _initialize_lms(self) -> None:
+        import copy
+        enable_lora = bool(self.lora_config)
+        self.cloned_models = []
+        self.cloned_gpu_cache = []
+        for remote_worker in self.model_executor.workers:
+            remote_worker_device = remote_worker.execute_method('get_device').get()
+            remote_worker_model = remote_worker.execute_method('get_model').get()
+            if enable_lora:
+                remote_worker_model._adapter_manager.model.to('cpu')
+            else:
+                remote_worker_model.to('cpu')
+            cloned_model = copy.deepcopy(remote_worker_model)
+            remote_worker.execute_method('del_model').get()
+            del remote_worker_model
+            if enable_lora:
+                cloned_model._adapter_manager.model.to(remote_worker_device)
+            else:
+                cloned_model.to(remote_worker_device)
+            remote_worker.execute_method('set_model', cloned_model).get()
+            self.cloned_models.append(cloned_model)
+
+            remote_gpu_cache = remote_worker.execute_method('get_gpu_cache').get()
+            for kv_cache in remote_gpu_cache:
+                for layer_idx in range(len(kv_cache)):
+                    kv_cache[layer_idx] = kv_cache[layer_idx].to('cpu')
+            cloned_gpu_cache = copy.deepcopy(remote_gpu_cache)
+            remote_worker.execute_method('del_gpu_cache').get()
+            del remote_gpu_cache
+            for kv_cache in cloned_gpu_cache:
+                for layer_idx in range(len(kv_cache)):
+                    kv_cache[layer_idx] = kv_cache[layer_idx].to(remote_worker_device)
+            remote_worker.execute_method('set_gpu_cache', cloned_gpu_cache).get()
+            self.cloned_gpu_cache.append(cloned_gpu_cache)
+        self.model_executor._run_workers("_warm_up_model")
+
+import copy
+import datasets
+import gc
+import itertools
+import torch.multiprocessing as mp
+from transformers import (AutoTokenizer,
+                          DataCollatorForLanguageModeling,
+                          PreTrainedTokenizerBase)
+from vllm.attention import AttentionMetadata
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import graph_capture, get_world_group
+from vllm.forward_context import set_forward_context
+from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.worker.worker import init_worker_distributed_environment
+
+class PeftCUDAGraphRunner:
+
+    def __init__(self, model: torch.nn.Module):
+        self.model = model
+        self.input_buffers: Dict[str, torch.Tensor] = {}
+        self.output_buffers: Dict[str, torch.Tensor] = {}
+        self._graph: Optional[torch.cuda.CUDAGraph] = None
+
+    @property
+    def graph(self):
+        assert self._graph is not None
+        return self._graph
+
+    def capture(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        hidden_or_intermediate_states = self.model(
+            input_ids = input_ids,
+            positions = positions,
+            kv_caches = kv_caches,
+            attn_metadata = attn_metadata
+        )
+
+        # Wait for the warm up operations to finish before proceeding with
+        # Graph Capture.
+        torch.cuda.synchronize()
+        # Capture the graph.
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph, stream=stream):
+            output_hidden_or_intermediate_states = self.model(
+                input_ids = input_ids,
+                positions = positions,
+                kv_caches = kv_caches,
+                attn_metadata = attn_metadata
+            )
+            hidden_or_intermediate_states = (output_hidden_or_intermediate_states)
+            del output_hidden_or_intermediate_states
+            gc.collect()
+        torch.cuda.synchronize()
+
+        # Save the input and output buffers.
+        self.input_buffers = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "kv_caches": kv_caches,
+            "slot_mapping": attn_metadata.slot_mapping,
+            "seq_lens_tensor": attn_metadata.seq_lens_tensor,
+            "block_tables": attn_metadata.block_tables,
+        }
+        self.output_buffers = {
+            "hidden_states": hidden_or_intermediate_states
+        }
+        return hidden_or_intermediate_states
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        # KV caches are fixed tensors, so we don't need to copy them.
+        del kv_caches
+
+        # Copy the input tensors to the input buffers.
+        self.input_buffers["input_ids"].copy_(input_ids, non_blocking=True)
+        self.input_buffers["positions"].copy_(positions, non_blocking=True)
+        self.input_buffers["slot_mapping"].copy_(attn_metadata.slot_mapping, non_blocking=True)
+        self.input_buffers["seq_lens_tensor"].copy_(attn_metadata.seq_lens_tensor, non_blocking=True)
+        self.input_buffers["block_tables"].copy_( attn_metadata.block_tables, non_blocking=True)
+
+        # Run the graph.
+        self.graph.replay()
+        # Return the output tensor.
+        return self.output_buffers["hidden_states"]
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+def prepare_alpaca(
+    sample_raw,
+    tokenizer: PreTrainedTokenizerBase,
+    seq_len: int,
+):
+    template = {
+        "description": "A shorter template to experiment with.",
+        "prompt_input": "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n",
+        "prompt_no_input": "### Instruction:\n{instruction}\n\n### Response:\n",
+        "response_split": "### Response:"
+    }
+    if len(sample_raw["input"]):
+        sample_text = template["prompt_input"].format(
+            instruction=sample_raw["instruction"], input=sample_raw["input"]
+        )
+    else:
+        sample_text = template["prompt_no_input"].format(
+            instruction=sample_raw["instruction"]
+        )
+    if len(sample_raw["output"]):
+        sample_text += sample_raw["output"]
+    sample_tokens = tokenizer(sample_text, padding='max_length', truncation=True, max_length=seq_len)
+    #sample_tokens = tokenizer(sample_text, padding=False, truncation=True, max_length=seq_len)
+    return sample_tokens
+
+def finetune(
+    model_or_manager: Union[torch.nn.Module, LRUCacheWorkerLoRAManager],
+    gpu_cache: List[List[torch.Tensor]],
+    parallel_config: ParallelConfig,
+    tokenizer: str,
+    cache_dir: str,
+    lms_forward_tasklets: int,
+    lms_forward_wait: float,
+    lms_backward_tasklets: int,
+    lms_backward_wait: float,
+    lms_output: str,
+    rank: int,
+    world_size: int,
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+) -> None:
+    assert torch.distributed.is_initialized() == False
+    torch.cuda.set_device(rank)
+    init_worker_distributed_environment(
+        parallel_config = parallel_config,
+        rank = rank,
+        distributed_init_method = "tcp://127.0.0.1:28765",
+    )
+
+    graph_runners: List[Dict[int, PeftCUDAGraphRunner]] = [
+        {} for _ in range(parallel_config.pipeline_parallel_size)
+    ]
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer, padding_side='left', cache_dir=cache_dir)
+    tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
+
+    dataset = datasets.load_dataset(
+        "yahma/alpaca-cleaned",
+        cache_dir = cache_dir,
+    )
+    dataset = dataset.map(
+        lambda sample_raw: prepare_alpaca(sample_raw, tokenizer, 500),
+        remove_columns=dataset["train"].column_names,
+    )
+    dataloader = torch.utils.data.DataLoader(
+        dataset["train"],
+        shuffle=False,
+        collate_fn=DataCollatorForLanguageModeling(tokenizer, mlm=False),
+        batch_size=1,
+        pin_memory=False,
+    )
+    dataloader_iter = itertools.cycle(iter(dataloader))
+
+    if model_or_manager.lora_config:
+        model = model_or_manager._adapter_manager.model
+    else:
+        model = model_or_manager
+
+    model.add_lora_train(device=torch.cuda.current_device())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    forward_time = 0
+    finetune_time = 0
+    consumed_finetune_samples = 0
+
+    while True:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_forward_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+
+        sample_tokens = next(dataloader_iter)
+        sample_tokens.to(torch.cuda.current_device())
+        input_ids = sample_tokens["input_ids"]
+        attention_mask = sample_tokens["attention_mask"]
+        labels = sample_tokens["labels"]
+
+        fused_flag = torch.tensor(False, device=torch.cuda.current_device(), dtype=torch.bool)
+        if not task_queue.empty():
+            (fused, model_input, worker_input) = task_queue.get()
+            fused_flag.fill_(fused)
+        torch.distributed.broadcast(fused_flag, src=0, group=get_world_group().device_group)
+
+        if fused_flag:
+            if model_or_manager.lora_config:
+                model_or_manager.set_active_adapters(model_input.lora_requests,
+                                                     model_input.lora_mapping)
+
+            attn_metadata = copy.deepcopy(model_input.attn_metadata)
+            attn_metadata.slot_mapping = attn_metadata.slot_mapping.to(torch.cuda.current_device())
+            attn_metadata.seq_lens_tensor = attn_metadata.seq_lens_tensor.to(torch.cuda.current_device())
+            attn_metadata.query_start_loc = attn_metadata.query_start_loc.to(torch.cuda.current_device())
+            attn_metadata.seq_start_loc = attn_metadata.seq_start_loc.to(torch.cuda.current_device())
+            attn_metadata.context_lens_tensor = attn_metadata.context_lens_tensor.to(torch.cuda.current_device())
+            attn_metadata.block_tables = attn_metadata.block_tables.to(torch.cuda.current_device())
+            sampling_metadata = copy.deepcopy(model_input.sampling_metadata)
+            sampling_metadata.selected_token_indices = sampling_metadata.selected_token_indices.to(torch.cuda.current_device())
+            sampling_metadata.categorized_sample_indices = {
+                key: value.to(torch.cuda.current_device())
+                for key, value in sampling_metadata.categorized_sample_indices.items()
+            }
+            input_tokens = model_input.input_tokens.to(torch.cuda.current_device())
+            input_positions = model_input.input_positions.to(torch.cuda.current_device())
+
+            """
+            if attn_metadata.decode_metadata.use_cuda_graph:
+                batch_size: int = input_tokens.shape[0]
+                if batch_size not in graph_runners[worker_input.virtual_engine]:
+                    with graph_capture() as graph_capture_context:
+                        with set_forward_context(attn_metadata):
+                            graph_runner = PeftCUDAGraphRunner(model)
+                            graph_runner.capture(
+                                input_ids = input_tokens,
+                                positions = input_positions,
+                                kv_caches = gpu_cache[worker_input.virtual_engine],
+                                attn_metadata = attn_metadata,
+                                stream = graph_capture_context.stream,
+                            )
+                            graph_runners[worker_input.virtual_engine][batch_size] = (graph_runner)
+
+                model_executable = graph_runners[worker_input.virtual_engine][batch_size]
+            else:
+                model_executable = model
+
+            with set_forward_context(attn_metadata):
+                hidden_or_intermediate_states = model_executable(
+                    input_ids = input_tokens,
+                    positions = input_positions,
+                    kv_caches = gpu_cache[worker_input.virtual_engine],
+                    attn_metadata = attn_metadata,
+                )
+
+            logits = model.compute_logits(hidden_or_intermediate_states,
+                                          sampling_metadata)
+            """
+
+            with set_forward_context(attn_metadata):
+                logits, i_hidden_states = model.fused_forward(
+                    input_ids = input_ids,
+                    attention_mask = attention_mask,
+                    positions = None,
+                    i_input_ids = input_tokens,
+                    i_positions = input_positions,
+                    kv_caches = gpu_cache[worker_input.virtual_engine],
+                    attn_metadata = attn_metadata,
+                )
+
+            i_logits = model.compute_logits(i_hidden_states,
+                                          sampling_metadata)
+
+            if rank == 0:
+                # Sample the next token.
+                output: SamplerOutput = model.sample(
+                    logits = i_logits,
+                    sampling_metadata = sampling_metadata,
+                )
+                result_queue.put_nowait([output])
+        else:
+            finetune_task = model.unfused_forward(
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                positions = None,
+            )
+
+            cur_tasklets = 0
+            for finetune_output in finetune_task:
+                if finetune_output is not None:
+                    logits = finetune_output
+
+                cur_tasklets += 1
+                if not task_queue.empty():
+                    if cur_tasklets % lms_forward_tasklets == 0:
+                        time.sleep(lms_forward_wait)
+                    (fused, model_input, worker_input) = task_queue.get()
+                    if fused and rank == 0:
+                        result_queue.put_nowait(None)
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss_fct = torch.nn.CrossEntropyLoss()
+        shift_logits = shift_logits.view(-1, model.config.vocab_size)
+        shift_labels = shift_labels.view(-1)
+        loss = loss_fct(shift_logits, shift_labels)
+
+        end_forward_event.record()
+        torch.cuda.synchronize()
+
+        #loss.backward()
+        cur_tasklets = 0
+        coro_task = loss.coro_backward()
+        for _ in coro_task:
+            if not task_queue.empty():
+                if cur_tasklets % lms_backward_tasklets == 0:
+                    time.sleep(lms_backward_wait)
+                (fused, model_input, worker_input) = task_queue.get()
+                if fused and rank == 0:
+                    result_queue.put_nowait(None)
+
+        optimizer.step()
+        optimizer.zero_grad()
+
+        end_event.record()
+        torch.cuda.synchronize()
+        forward_time += start_event.elapsed_time(end_forward_event) / 1e3
+        finetune_time += start_event.elapsed_time(end_event) / 1e3
+
+        consumed_finetune_samples += 1
+        if rank == 0 and finetune_time > 10.0:
+            import os
+            lms_log = lms_output + '/lms.log'
+            mode = 'a' if os.path.exists(lms_log) else 'w'
+            with open(lms_log, mode, encoding='utf-8') as f:
+                print(
+                    "Avg tps(samples/s) forward: %.2f, backward: %.2f, finetune: %.2f, Duration(s): %.2f"  % (
+                        consumed_finetune_samples / forward_time,
+                        consumed_finetune_samples / (finetune_time - forward_time),
+                        consumed_finetune_samples / finetune_time,
+                        finetune_time,
+                    ),
+                    file=f
+                )
+            forward_time = 0
+            finetune_time = 0
+            consumed_finetune_samples = 0
+
+def _add_finetune_request(
+    llm_engine: LLMEngine,
+    tokenizer: str,
+    download_dir: str,
+    lms_forward_tasklets: int,
+    lms_forward_wait: float,
+    lms_backward_tasklets: int,
+    lms_backward_wait: float,
+    lms_output: str,
+) -> None:
+    enable_lora = bool(llm_engine.lora_config)
+    world_size = get_tensor_model_parallel_world_size()
+    llm_engine.task_queues = [mp.Queue() for _ in range(world_size)]
+    llm_engine.result_queue = mp.Queue()
+    processes = []
+    for rank in range(world_size):
+        result_queue = None
+        if rank:
+            cloned_model = llm_engine.cloned_models[rank - 1]
+            cloned_gpu_cache = llm_engine.cloned_gpu_cache[rank - 1]
+        else:
+            if enable_lora:
+                cloned_model = llm_engine.model_executor.driver_worker.model_runner.lora_manager
+            else:
+                cloned_model = llm_engine.model_executor.driver_worker.model_runner.model
+            cloned_gpu_cache = llm_engine.model_executor.driver_worker.gpu_cache
+            result_queue = llm_engine.result_queue
+
+        p = mp.Process(
+            target=finetune,
+            args=(cloned_model,
+                  cloned_gpu_cache,
+                  llm_engine.model_executor.driver_worker.parallel_config,
+                  tokenizer,
+                  download_dir,
+                  lms_forward_tasklets,
+                  lms_forward_wait,
+                  lms_backward_tasklets,
+                  lms_backward_wait,
+                  lms_output,
+                  rank,
+                  world_size,
+                  llm_engine.task_queues[rank],
+                  result_queue,
+            ),
+        )
+        p.daemon = True
+        processes.append(p)
+    for p in processes:
+        p.start()

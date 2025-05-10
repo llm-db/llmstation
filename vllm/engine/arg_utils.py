@@ -179,6 +179,13 @@ class EngineArgs:
     override_neuron_config: Optional[Dict[str, Any]] = None
     mm_processor_kwargs: Optional[Dict[str, Any]] = None
     scheduling_policy: Literal["fcfs", "priority"] = "fcfs"
+    # Author: Yongjun
+    enable_lms: bool = False
+    lms_forward_tasklets: int = 32
+    lms_forward_wait: float = 0.0
+    lms_backward_tasklets: int = 32
+    lms_backward_wait: float = 0.0
+    lms_output: Optional[str] = None
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -823,6 +830,29 @@ class EngineArgs:
             'priority (lower value means earlier handling) and time of '
             'arrival deciding any ties).')
 
+        # Author: Yongjun
+        parser.add_argument('--enable-lms',
+                            action='store_true',
+                            help='If True, enable handling of LoRA adapters fine-tuning.')
+        parser.add_argument('--lms-forward-tasklets',
+                            type=int,
+                            default=32,
+                            help='Number of tasklets performed in forward pass before preemption.')
+        parser.add_argument('--lms-forward-wait',
+                            type=float,
+                            default=0.0,
+                            help='Wait in seconds after preemption in forward pass.')
+        parser.add_argument('--lms-backward-tasklets',
+                            type=int,
+                            default=32,
+                            help='Number of tasklets performed in backward pass before preemption.')
+        parser.add_argument('--lms-backward-wait',
+                            type=float,
+                            default=0.0,
+                            help='Wait in seconds after preemption in backward pass.')
+        parser.add_argument('--lms-output',
+                            type=str,
+                            help='Directory to record LLMStation throughput.')
         return parser
 
     @classmethod
@@ -861,6 +891,13 @@ class EngineArgs:
             override_neuron_config=self.override_neuron_config,
             config_format=self.config_format,
             mm_processor_kwargs=self.mm_processor_kwargs,
+            # Author: Yongjun
+            enable_lms=self.enable_lms,
+            lms_forward_tasklets=self.lms_forward_tasklets,
+            lms_forward_wait=self.lms_forward_wait,
+            lms_backward_tasklets=self.lms_backward_tasklets,
+            lms_backward_wait=self.lms_backward_wait,
+            lms_output=self.lms_output,
         )
 
     def create_load_config(self) -> LoadConfig:
