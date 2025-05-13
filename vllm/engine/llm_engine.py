@@ -1399,9 +1399,8 @@ class LLMEngine:
                         execute_model_req.virtual_engine,
                         execute_model_req.finished_requests_ids))
 
-                if scheduler_outputs.running_queue_size == 1:
-                    if model_input.attn_metadata.prefill_metadata is not None:
-                        time.sleep(self.model_config.fineinfer_defer)
+                if model_input.attn_metadata.decode_metadata is None:
+                    time.sleep(self.model_config.fineinfer_defer)
 
                 for task_queue in self.task_queues:
                     task_queue.put_nowait(True)
