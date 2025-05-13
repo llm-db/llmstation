@@ -1408,7 +1408,7 @@ class LLMEngine:
 
             if self.model_config.enable_fineinfer:
                 while self.is_finetuning:
-                    time.sleep(0.001)
+                    time.sleep(0.005)
 
             outputs = self.model_executor.execute_model(
                 execute_model_req=execute_model_req)
@@ -2097,7 +2097,7 @@ def finetune(
         if not task_queue.empty():
             unfinished_requests = task_queue.get()
         if unfinished_requests:
-            time.sleep(0.001)
+            time.sleep(0.005)
             end_forward_event.record()
             end_event.record()
             torch.cuda.synchronize()
@@ -2146,7 +2146,7 @@ def finetune(
         if not task_queue.empty():
             unfinished_requests = task_queue.get()
         while unfinished_requests:
-            time.sleep(0.001)
+            time.sleep(0.005)
             if not task_queue.empty():
                 unfinished_requests = task_queue.get()
 
