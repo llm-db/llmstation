@@ -2311,6 +2311,7 @@ def finetune(
         cur_tasklets = 0
         coro_task = loss.coro_backward()
         for _ in coro_task:
+            cur_tasklets += 1
             if not task_queue.empty():
                 if cur_tasklets % lms_backward_tasklets == 0:
                     time.sleep(lms_backward_wait)
