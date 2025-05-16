@@ -27,7 +27,7 @@ conda activate baseline
 ```
 [Install PyTorch 2.4.0 from scratch](https://github.com/pytorch/pytorch/tree/v2.4.0?tab=readme-ov-file#from-source)
 ```
-# conda install -c conda-forge libstdcxx-ng
+# conda install -c conda-forge libstdcxx-ng=13
 # export CUDA_HOME=/usr/local/cuda-12.6
 # export PATH=$CUDA_HOME/bin:$PATH
 # export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
@@ -75,7 +75,7 @@ conda activate lms
 ```
 Install customized PyTorch 2.4.0
 ```
-# conda install -c conda-forge libstdcxx-ng
+# conda install -c conda-forge libstdcxx-ng=13
 # export CUDA_HOME=/usr/local/cuda-12.6
 # export PATH=$CUDA_HOME/bin:$PATH
 # export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
