@@ -155,8 +155,8 @@ please use `python python_only_dev.py` before execution, and `python python_only
 These two commands allow users to switch between vanilla vLLM and FineInfer.
 NVIDIA MPS has a negligible impact on temporal sharing and is therefore not enabled.
 ```
-cd FineInfer
 conda activate baseline
+cd ~
 git clone -b vllm-v0.6.3-fineinfer https://github.com/llm-db/llmstation.git vllm-v0.6.3-fineinfer
 cd vllm-v0.6.3-fineinfer
 python python_only_dev.py
@@ -166,6 +166,7 @@ python python_only_dev.py --quit-dev
   - For Figure 10, you only need to adjust _fineinfer defer_  until the PEFT throughput is the same as points on the X-axis.
   - For Figure 13, you need to adjust LoRA distribution, LoRA rank, and _fineinfer defer_.
 ```
+cd FineInfer
 cd fig8a
 # ./run.sh <download dir> <request rate> <fineinfer defer>
 ./run.sh $HOME/scratch 1 0.1
