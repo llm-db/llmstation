@@ -228,16 +228,16 @@ Then you will find that LLMStation can surpass all baselines while meeting the S
 ```
 cd fig8a
 # ./run.sh <download dir> <request rate> <forward tasklets> <forward wait> <backward tasklets> <backward wait>
-./run.sh $HOME/scratch 1 8 0.005 4 0.002
+./run.sh $HOME/scratch 1 8 0.005 8 0.005
 cd fig9a
 # ./run.sh <download dir> <request rate> <forward tasklets> <forward wait> <backward tasklets> <backward wait>
-./run.sh $HOME/scratch 1 8 0.005 4 0.002
+./run.sh $HOME/scratch 1 8 0.005 8 0.005
 cd fig10
 # ./run.sh <download dir> <forward tasklets> <forward wait> <backward tasklets> <backward wait>
-./run.sh $HOME/scratch 8 0.005 4 0.002
+./run.sh $HOME/scratch 8 0.005 8 0.005
 cd fig13
 # ./run.sh <download dir> <LoRA distribution> <LoRA rank> <forward tasklets> <forward wait> <backward tasklets> <backward wait>
-./run.sh $HOME/scratch "uniform" 8 8 0.005 4 0.002
+./run.sh $HOME/scratch "uniform" 8 8 0.005 8 0.005
 ```
   - For Figure 12, in order to make the number of pauses for each forward pass or backward pass greater than the number of layers,
     you may need to adjust the number [here](https://github.com/llm-db/llmstation/blob/pytorch-v2.4.0-lms/torch/csrc/autograd/engine.cpp#L902) and then re-install PyTorch.
