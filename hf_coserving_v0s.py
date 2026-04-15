@@ -2,6 +2,9 @@
 Co-serving v0s: multiprocessing (spawn) with shared GPU memory via CUDA IPC.
 Schedule: decode || train_fwd (parallel) -> backward+optimizer (sequential)
 
+Decode uses KV cache: prefill at step 0, then single-token decode with
+past_key_values at steps 1+.
+
 The decode worker receives model parameters/buffers as CUDA IPC handles, so
 both processes access the SAME physical GPU memory. No model weight duplication.
 
@@ -28,7 +31,7 @@ SEQ_LEN = 300
 
 
 def decode_worker(shared_state_q, task_q, result_q):
-    """Decode worker. Builds model architecture, then uses shared GPU tensors."""
+    """Decode worker with KV cache. Prefill on first call, then single-token decode."""
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
@@ -64,19 +67,37 @@ def decode_worker(shared_state_q, task_q, result_q):
     model.set_adapter("infer")
     model.eval()
 
+    past_key_values = None
+
     result_q.put("ready")
 
     while True:
         msg = task_q.get()
         if msg is None:
             break
-        generated_ids = msg.cuda()
+
+        op = msg[0]
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+
         with torch.no_grad():
-            logits = model(input_ids=generated_ids).logits[:, -1, :]
+            if op == "prefill":
+                # Prefill: full prompt forward, build KV cache
+                input_ids = msg[1].cuda()
+                out = model(input_ids=input_ids, use_cache=True)
+                past_key_values = out.past_key_values
+                logits = out.logits[:, -1, :]
+            else:
+                # Decode: single token with KV cache
+                cur_token = msg[1].cuda()
+                position_ids = torch.tensor([[msg[2]]], device=cur_token.device)
+                out = model(input_ids=cur_token, past_key_values=past_key_values,
+                            position_ids=position_ids, use_cache=True)
+                past_key_values = out.past_key_values
+                logits = out.logits[:, -1, :]
             next_token = logits.argmax(dim=-1, keepdim=True)
+
         torch.cuda.synchronize()
         t1 = time.perf_counter()
 
@@ -150,10 +171,15 @@ if __name__ == "__main__":
     train_fwd_times = []
     bwd_opt_times = []
 
+    generated_tokens = []  # tokens generated so far (CPU)
+    # Position of the last token consumed by the KV cache.
+    # After prefill, the cache covers positions 0..prompt_len-1.
+    kv_pos = input_ids.shape[-1] - 1
+
     for step in range(MAX_NEW_TOKENS):
         # ==============================================================
         # Phase 1: Decode || Train forward (parallel)
-        #   - Decode worker: infer adapter forward (shared GPU memory)
+        #   - Decode worker: infer adapter forward with KV cache
         #   - Main process: ft adapter forward (compute loss)
         # ==============================================================
         model.set_adapter("ft")
@@ -164,7 +190,15 @@ if __name__ == "__main__":
         t0 = time.perf_counter()
 
         # Dispatch decode to worker (non-blocking)
-        task_q.put(generated_ids.cpu())
+        if step == 0:
+            # Prefill: send full prompt, worker builds KV cache
+            task_q.put(("prefill", input_ids.cpu()))
+            kv_pos = input_ids.shape[-1] - 1  # cache covers 0..prompt_len-1
+        else:
+            # Decode: send last generated token + its position
+            last_token = generated_tokens[-1]  # already CPU tensor (1,1)
+            kv_pos += 1
+            task_q.put(("decode", last_token, kv_pos))
 
         # Train forward in main process (runs in parallel with decode worker)
         loss = model(input_ids=train_ids, labels=train_ids).loss
@@ -175,6 +209,7 @@ if __name__ == "__main__":
         next_token, decode_time = result_q.get()
         t1 = time.perf_counter()
 
+        generated_tokens.append(next_token)  # CPU tensor (1,1)
         generated_ids = torch.cat([generated_ids, next_token.to(model.device)], dim=-1)
 
         if next_token.item() == tokenizer.eos_token_id:

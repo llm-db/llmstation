@@ -31,38 +31,39 @@ Benchmarking co-serving (simultaneous inference + LoRA fine-tuning) on a single 
 
 **Speed (avg per step, ms):**
 
+All versions use KV cache for decode. Non-compile: after 3 warmup. Compile: after 5 warmup + CUDA graph.
+
 | Version | decode | train_fwd | fused_fwd | bwd+opt | total | vs baseline |
 |---------|--------|-----------|-----------|---------|-------|-------------|
-| inference | 38.59 | — | — | — | 38.59 | (ref) |
+| inference | 31.21 | — | — | — | 31.21 | (ref) |
 | peft | — | — | 64.76 | 74.56 | 139.32 | (ref) |
-| v0 | 41.79 | 59.50 | — | 73.62 | 174.91 | baseline |
-| v0s | wall 107.99 | (parallel) | — | 70.89 | 178.88 | +2.3% |
-| v1 | — | — | 73.70 | 80.87 | 154.56 | −11.6% |
-| v2 | — | — | 73.41 | 72.48 | 145.89 | −16.6% |
-| v3 | — | — | 70.39 | 71.93 | 142.32 | −18.6% |
+| v0 | 33.61 | 58.01 | — | 71.91 | 163.52 | baseline |
+| v0s | wall 97.31 | (parallel) | — | 69.84 | 167.14 | +2.2% |
+| v1 | — | — | 63.45 | 73.17 | 136.62 | −16.5% |
+| v2 | — | — | 63.64 | 71.58 | 135.23 | −17.3% |
+| v3 | — | — | 61.44 | 72.09 | 133.53 | −18.3% |
 | v0_compile | 33.12 | 52.83 | — | 65.11 | 151.06 | baseline_c |
 | v3_compile | — | — | 55.75 | 66.39 | 122.13 | −19.1% |
 
-- Non-compile: after 3 warmup steps. Compile: after 5 warmup, KV cache for decode.
-- Baselines: v0 (naive co-serving) and v0_compile (naive co-serving + compile). inference/peft are reference only.
+- Baselines: v0 (naive co-serving) and v0_compile (naive + compile). inference/peft are reference only.
 - peft_compile = v0_compile train_fwd + bwd = 117.94 ms (same compiled HF forward with ft adapter)
-- v0s parallel overlap saves 36.7% vs sequential, but HBM contention inflates each op ~2.5×, net slower than v0
-- v2 backward is 10.4% faster than v1 (skips inference token gradients)
-- v3 forward is 4.1% faster than v2 (SGMV Triton fuses 224 cuBLAS → 112 Triton kernel launches)
+- v0s parallel overlap: decode (94.22) || train_fwd (96.60), wall=97.31. HBM contention inflates each op ~2.8×, net slower than v0.
+- v2 backward is 2.2% faster than v1 (skips 1 infer token in backward, small with KV cache)
+- v3 forward is 3.5% faster than v2 (SGMV Triton fuses 224 cuBLAS → 112 Triton kernel launches)
 - v3 backward matches v2 (bf16 LoRA gradients, recomputed mid, no large fp32 casts)
-- v0 → v0_compile: decode −20.7% (KV cache), train_fwd −11.2% (CUDA graph)
-- v3 → v3_compile: fused_fwd −20.8% (KV cache shrinks infer from growing seq to 1 token)
+- v0 → v0_compile: train_fwd −8.9% + bwd −9.5% (CUDA graph)
+- v3 → v3_compile: fused_fwd −9.3% + bwd −7.9% (CUDA graph)
 
 **Weight equivalence (step 30):**
-- peft vs v0: max_diff=5.47e-04, ALL PASS
-- peft vs v0s: max_diff=5.91e-04, ALL PASS
-- peft vs v1: max_diff=5.19e-04, ALL PASS
-- peft vs v2: max_diff=5.51e-04, ALL PASS
-- peft vs v3: max_diff=1.29e-03, ALL PASS
-- v2 vs v3: max_diff=1.22e-03, ALL PASS
+- peft vs v0: max_diff=4.93e-04, ALL PASS
+- peft vs v0s: max_diff=4.90e-04, ALL PASS
+- peft vs v1: max_diff=7.44e-04, ALL PASS
+- peft vs v2: max_diff=4.54e-04, ALL PASS
+- peft vs v3: max_diff=6.47e-04, ALL PASS
+- v2 vs v3: max_diff=5.12e-04, ALL PASS
 - All 112 LoRA params within atol=5e-3
 
-**Loss (step 30):** peft=0.9056, v0=0.9029, v0s=0.9075, v1=0.9062, v2=0.9062, v3=0.9062
+**Loss (step 30):** peft=0.9056, v0=0.9042, v0s=0.9066, v1=0.9062, v2=0.9023, v3=0.9062
 
 ## Why each version is faster than the previous
 

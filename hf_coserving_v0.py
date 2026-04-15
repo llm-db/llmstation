@@ -47,22 +47,45 @@ decode_times = []
 train_fwd_times = []
 bwd_opt_times = []
 
-# Coserving loop: alternate decode and LoRA steps
-for step in range(max_new_tokens):
-    # --- Decode (inference forward, using infer adapter) ---
-    model.set_adapter("infer")
-    model.eval()
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        logits = model(input_ids=generated_ids).logits[:, -1, :]
-        next_token = logits.argmax(dim=-1, keepdim=True)
-    torch.cuda.synchronize()
-    t1 = time.perf_counter()
+# Prefill: process the full prompt and build the KV cache (infer adapter)
+model.set_adapter("infer")
+model.eval()
+with torch.no_grad():
+    out = model(input_ids=input_ids, use_cache=True)
+    past_key_values = out.past_key_values
+    logits = out.logits[:, -1, :]
+    next_token = logits.argmax(dim=-1, keepdim=True)
+generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+next_pos = input_ids.shape[-1]  # position of the token we just generated
 
-    generated_ids = torch.cat([generated_ids, next_token], dim=-1)
-    if next_token.item() == tokenizer.eos_token_id:
-        break
+# Coserving loop: decode with KV cache + LoRA training steps
+for step in range(max_new_tokens):
+    if step == 0:
+        # Step 0: prefill already decoded; train only (skip decode timing)
+        if next_token.item() == tokenizer.eos_token_id:
+            break
+        t0 = t1 = 0.0  # no decode this step
+    else:
+        # --- Decode with KV cache (inference forward, using infer adapter) ---
+        model.set_adapter("infer")
+        model.eval()
+        cur_token = generated_ids[:, -1:]
+        position_ids = torch.tensor([[next_pos]], device=model.device)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = model(input_ids=cur_token, past_key_values=past_key_values,
+                        position_ids=position_ids, use_cache=True)
+            past_key_values = out.past_key_values
+            logits = out.logits[:, -1, :]
+            next_token = logits.argmax(dim=-1, keepdim=True)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+        next_pos += 1
+        if next_token.item() == tokenizer.eos_token_id:
+            break
 
     # --- PEFT forward (training, using ft adapter) ---
     train_ids = train_all_ids[step:step+1]
@@ -84,7 +107,8 @@ for step in range(max_new_tokens):
     t5 = time.perf_counter()
 
     if step >= warmup_steps:
-        decode_times.append(t1 - t0)
+        if step > 0:
+            decode_times.append(t1 - t0)
         train_fwd_times.append(t3 - t2)
         bwd_opt_times.append(t5 - t4)
 
@@ -94,7 +118,8 @@ for step in range(max_new_tokens):
         print(f"[CHECKPOINT] step 30 weight sum: {sum(v.sum().item() for v in ckpt.values()):.10f}")
 
     if step % 10 == 0:
-        print(f"step {step:3d} | loss={loss.item():.4f} | decode={t1-t0:.4f}s | train_fwd={t3-t2:.4f}s | bwd+opt={t5-t4:.4f}s")
+        dt_decode = (t1 - t0) if step > 0 else 0.0
+        print(f"step {step:3d} | loss={loss.item():.4f} | decode={dt_decode:.4f}s | train_fwd={t3-t2:.4f}s | bwd+opt={t5-t4:.4f}s")
 
 response = tokenizer.decode(generated_ids[0][input_ids.shape[-1]:], skip_special_tokens=True)
 print(f"\n--- Generated response ---\n{response}")

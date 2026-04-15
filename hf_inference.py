@@ -22,16 +22,39 @@ warmup_steps = 3
 decode_times = []
 
 model.eval()
+
+# Prefill: process the full prompt and build the KV cache
+with torch.no_grad():
+    out = model(input_ids=input_ids, use_cache=True)
+    past_key_values = out.past_key_values
+    logits = out.logits[:, -1, :]
+    next_token = logits.argmax(dim=-1, keepdim=True)
+generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+next_pos = input_ids.shape[-1]  # position of the token we just generated
+
 for step in range(max_new_tokens):
+    if step == 0:
+        # Step 0 was the prefill decode above; skip timing but check EOS
+        if next_token.item() == tokenizer.eos_token_id:
+            break
+        continue
+
+    # Decode with KV cache: feed only the last token + position_ids
+    cur_token = generated_ids[:, -1:]
+    position_ids = torch.tensor([[next_pos]], device=model.device)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
-        logits = model(input_ids=generated_ids).logits[:, -1, :]
+        out = model(input_ids=cur_token, past_key_values=past_key_values,
+                    position_ids=position_ids, use_cache=True)
+        past_key_values = out.past_key_values
+        logits = out.logits[:, -1, :]
         next_token = logits.argmax(dim=-1, keepdim=True)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
 
     generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+    next_pos += 1
     if next_token.item() == tokenizer.eos_token_id:
         break
 

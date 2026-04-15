@@ -41,7 +41,6 @@ for i in range(max_new_tokens):
 train_all_ids = torch.cat(train_all_ids, dim=0).to(model.device)
 
 optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-generated_ids = input_ids.clone()
 
 # Navigate PEFT wrapper
 base = model.base_model.model.model
@@ -51,6 +50,11 @@ num_heads = cfg.num_attention_heads
 num_kv_heads = cfg.num_key_value_heads
 head_dim = cfg.hidden_size // num_heads
 n_rep = num_heads // num_kv_heads
+
+prompt_len = input_ids.shape[1]
+num_layers = len(base.layers)
+_kv_cache_k = [None] * num_layers
+_kv_cache_v = [None] * num_layers
 
 
 # --------------------------------------------------------------------------
@@ -102,39 +106,38 @@ def apply_rope(q, k, cos, sin):
     return (q * cos + rotate_half(q) * sin), (k * cos + rotate_half(k) * sin)
 
 
-def attn_forward(attn, infer_h, train_h, infer_rope, train_rope):
-    """
-    Flash Attention with fused QKV + O projections.
-    Fuse: q_proj, k_proj, v_proj, o_proj  (weight-loading matmuls)
-    Separate: RoPE, FlashAttn  (no model weights, activation-only ops)
-    """
+def attn_forward(attn, infer_h, train_h, infer_rope, train_rope, layer_idx):
     L_i, L_t = infer_h.shape[1], train_h.shape[1]
-
-    # Fused QKV projections (one weight load each)
     infer_q, train_q = fused_linear(attn.q_proj, infer_h, train_h)
     infer_k, train_k = fused_linear(attn.k_proj, infer_h, train_h)
     infer_v, train_v = fused_linear(attn.v_proj, infer_h, train_h)
 
-    def process_qkv(q, k, v, rope, seq_len, no_grad=False):
-        ctx = torch.no_grad() if no_grad else torch.enable_grad()
-        with ctx:
-            # flash_attn expects (batch, seqlen, nheads, head_dim)
-            q = q.view(1, seq_len, num_heads, head_dim)
-            k = k.view(1, seq_len, num_kv_heads, head_dim)
-            v = v.view(1, seq_len, num_kv_heads, head_dim)
+    # Infer path: KV cache
+    with torch.no_grad():
+        infer_q = infer_q.view(1, L_i, num_heads, head_dim)
+        infer_k = infer_k.view(1, L_i, num_kv_heads, head_dim)
+        infer_v = infer_v.view(1, L_i, num_kv_heads, head_dim)
+        cos_i, sin_i = infer_rope
+        infer_q, infer_k = apply_rope(infer_q, infer_k, cos_i, sin_i)
 
-            cos, sin = rope
-            q, k = apply_rope(q, k, cos, sin)
+        if _kv_cache_k[layer_idx] is not None:
+            infer_k = torch.cat([_kv_cache_k[layer_idx], infer_k], dim=1)
+            infer_v = torch.cat([_kv_cache_v[layer_idx], infer_v], dim=1)
+        _kv_cache_k[layer_idx] = infer_k
+        _kv_cache_v[layer_idx] = infer_v
 
-            # flash_attn_func handles GQA natively, no repeat_interleave needed
-            out = flash_attn_func(q, k, v, causal=True)
-            out = out.reshape(1, seq_len, -1)
-        return out
+        infer_attn = flash_attn_func(infer_q, infer_k, infer_v, causal=True)
+        infer_attn = infer_attn.reshape(1, L_i, -1)
 
-    infer_attn = process_qkv(infer_q, infer_k, infer_v, infer_rope, L_i, no_grad=True)
-    train_attn = process_qkv(train_q, train_k, train_v, train_rope, L_t, no_grad=False)
+    # Train path: no KV cache
+    train_q = train_q.view(1, L_t, num_heads, head_dim)
+    train_k = train_k.view(1, L_t, num_kv_heads, head_dim)
+    train_v = train_v.view(1, L_t, num_kv_heads, head_dim)
+    cos_t, sin_t = train_rope
+    train_q, train_k = apply_rope(train_q, train_k, cos_t, sin_t)
+    train_attn = flash_attn_func(train_q, train_k, train_v, causal=True)
+    train_attn = train_attn.reshape(1, L_t, -1)
 
-    # Fused O projection
     infer_out, train_out = fused_linear(attn.o_proj, infer_attn, train_attn)
     return infer_out, train_out
 
@@ -156,26 +159,23 @@ def mlp_forward(layer, infer_h, train_h):
     return infer_h + infer_down, train_h + train_down
 
 
-def coserving_forward(infer_ids, train_ids):
+def coserving_forward(infer_ids, train_ids, infer_pos):
     infer_h = base.embed_tokens(infer_ids).detach()
     train_h = base.embed_tokens(train_ids)
 
-    L_i, L_t = infer_ids.shape[1], train_ids.shape[1]
+    L_t = train_ids.shape[1]
     device = infer_ids.device
-    infer_pos = torch.arange(L_i, device=device).unsqueeze(0)
     train_pos = torch.arange(L_t, device=device).unsqueeze(0)
 
-    # Pre-compute RoPE for both paths
     rotary = base.rotary_emb
     infer_rope = rotary(infer_h, infer_pos)
     train_rope = rotary(train_h, train_pos)
 
-    for layer in base.layers:
+    for i, layer in enumerate(base.layers):
         infer_n = layer.input_layernorm(infer_h)
         train_n = layer.input_layernorm(train_h)
-
         infer_a, train_a = attn_forward(layer.self_attn, infer_n, train_n,
-                                         infer_rope, train_rope)
+                                         infer_rope, train_rope, layer_idx=i)
         infer_h = infer_h + infer_a
         train_h = train_h + train_a
         infer_h, train_h = mlp_forward(layer, infer_h, train_h)
@@ -190,22 +190,55 @@ def coserving_forward(infer_ids, train_ids):
 # Main loop
 # --------------------------------------------------------------------------
 
+device = input_ids.device
 fused_fwd_times = []
 bwd_opt_times = []
 
-for step in range(max_new_tokens):
-    model.train()
+# Prefill (step 0)
+model.train()
+train_ids_0 = train_all_ids[0:1]
+infer_pos_0 = torch.arange(prompt_len, device=device).unsqueeze(0)
 
+torch.cuda.synchronize()
+t0 = time.perf_counter()
+infer_logits, train_logits = coserving_forward(input_ids, train_ids_0, infer_pos_0)
+torch.cuda.synchronize()
+t1 = time.perf_counter()
+
+next_token = infer_logits[0, -1, :].argmax().reshape(1, 1)
+generated_tokens = [next_token]
+
+shift_logits = train_logits[:, :-1, :].contiguous()
+shift_labels = train_ids_0[:, 1:].contiguous()
+loss = F.cross_entropy(shift_logits.view(-1, shift_logits.shape[-1]), shift_labels.view(-1))
+
+torch.cuda.synchronize()
+t2 = time.perf_counter()
+loss.backward()
+optimizer.step()
+optimizer.zero_grad()
+torch.cuda.synchronize()
+t3 = time.perf_counter()
+
+print(f"step   0 | loss={loss.item():.4f} | fused_fwd={t1-t0:.4f}s | bwd+opt={t3-t2:.4f}s (prefill)")
+
+# Decode (steps 1+)
+for step in range(1, max_new_tokens):
+    model.train()
     train_ids = train_all_ids[step:step+1]
+    infer_pos = torch.full((1, 1), prompt_len + step - 1, device=device, dtype=torch.long)
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    infer_logits, train_logits = coserving_forward(generated_ids, train_ids)
+    infer_logits, train_logits = coserving_forward(next_token, train_ids, infer_pos)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
 
     next_token = infer_logits[0, -1, :].argmax().reshape(1, 1)
-    generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+    generated_tokens.append(next_token)
+
+    if next_token.item() == tokenizer.eos_token_id:
+        break
 
     shift_logits = train_logits[:, :-1, :].contiguous()
     shift_labels = train_ids[:, 1:].contiguous()
@@ -222,9 +255,6 @@ for step in range(max_new_tokens):
     torch.cuda.synchronize()
     t3 = time.perf_counter()
 
-    if next_token.item() == tokenizer.eos_token_id:
-        break
-
     if step >= warmup_steps:
         fused_fwd_times.append(t1 - t0)
         bwd_opt_times.append(t3 - t2)
@@ -237,7 +267,8 @@ for step in range(max_new_tokens):
     if step % 10 == 0:
         print(f"step {step:3d} | loss={loss.item():.4f} | fused_fwd={t1-t0:.4f}s | bwd+opt={t3-t2:.4f}s")
 
-response = tokenizer.decode(generated_ids[0][input_ids.shape[-1]:], skip_special_tokens=True)
+all_tokens = torch.cat([input_ids] + generated_tokens, dim=-1)
+response = tokenizer.decode(all_tokens[0][prompt_len:], skip_special_tokens=True)
 print(f"\n--- Generated response ---\n{response}")
 
 if fused_fwd_times:
