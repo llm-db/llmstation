@@ -18,6 +18,8 @@ Benchmarking co-serving (simultaneous inference + LoRA fine-tuning) on a single 
 | `hf_coserving_v1.py` | Fused co-serving: manual forward with matrix-level fusion (one HBM weight read for both paths), `attn_implementation="flash_attention_2"` + `flash_attn_func` directly |
 | `hf_coserving_v2.py` | Fused co-serving + custom backward: same fused forward as v1, but `FusedBaseLinear` autograd Function skips inference tokens in backward (train-only gradient) |
 | `hf_coserving_v3.py` | Fused co-serving + SGMV Triton kernels: replaces 4 cuBLAS LoRA calls per projection with 2 Triton kernel launches (shrink + expand) for both adapters, custom backward preserved |
+| `hf_coserving_v0_compile.py` | v0 + torch.compile piecewise CUDA graph + KV cache for decode (DynamicCache, 1 token/step) |
+| `hf_coserving_v3_compile.py` | v3 + torch.compile piecewise CUDA graph + KV cache for infer path, static fused shape (1, 301, H) |
 | `compare_weights.py` | Compares step-30 LoRA checkpoints across peft/v0/v0s/v1/v2/v3 |
 | `requirements.txt` | torch, transformers, accelerate, peft, datasets, ninja, flash-attn, einops, triton |
 
@@ -25,23 +27,31 @@ Benchmarking co-serving (simultaneous inference + LoRA fine-tuning) on a single 
 - r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], lora_dropout=0.0
 - v0/v0s/v1/v2/v3 use dual adapters: "ft" (train, grad) + "infer" (decode, no_grad)
 
-## Key results (128 steps, seq_len=300, after 3 warmup)
+## Key results (128 steps, seq_len=300)
 
-**Speed (avg per step):**
-- inference: 38.59 ms (decode only)
-- peft: 139.32 ms total (fwd 64.76 + bwd 74.56)
-- v0: 174.91 ms total (decode 41.79 + train_fwd 59.50 + bwd 73.62)
-- v0s: 178.88 ms total (parallel(decode 104.38, train_fwd 107.25) wall=107.99 + bwd 70.89)
-- v1: 154.56 ms total (fused_fwd 73.70 + bwd 80.87)
-- v2: 145.89 ms total (fused_fwd 73.41 + bwd 72.48)
-- v3: 142.32 ms total (fused_fwd 70.39 + bwd 71.93)
-- v0s parallel overlap saves 36.7% vs sequential (decode+fwd+bwd), but HBM contention inflates each op ~2.5×, net slower than v0
+**Speed (avg per step, ms):**
+
+| Version | decode | train_fwd | fused_fwd | bwd+opt | total | vs baseline |
+|---------|--------|-----------|-----------|---------|-------|-------------|
+| inference | 38.59 | — | — | — | 38.59 | (ref) |
+| peft | — | — | 64.76 | 74.56 | 139.32 | (ref) |
+| v0 | 41.79 | 59.50 | — | 73.62 | 174.91 | baseline |
+| v0s | wall 107.99 | (parallel) | — | 70.89 | 178.88 | +2.3% |
+| v1 | — | — | 73.70 | 80.87 | 154.56 | −11.6% |
+| v2 | — | — | 73.41 | 72.48 | 145.89 | −16.6% |
+| v3 | — | — | 70.39 | 71.93 | 142.32 | −18.6% |
+| v0_compile | 33.12 | 52.83 | — | 65.11 | 151.06 | baseline_c |
+| v3_compile | — | — | 55.75 | 66.39 | 122.13 | −19.1% |
+
+- Non-compile: after 3 warmup steps. Compile: after 5 warmup, KV cache for decode.
+- Baselines: v0 (naive co-serving) and v0_compile (naive co-serving + compile). inference/peft are reference only.
+- peft_compile = v0_compile train_fwd + bwd = 117.94 ms (same compiled HF forward with ft adapter)
+- v0s parallel overlap saves 36.7% vs sequential, but HBM contention inflates each op ~2.5×, net slower than v0
 - v2 backward is 10.4% faster than v1 (skips inference token gradients)
-- v3 forward is 4.1% faster than v2 (SGMV Triton fuses LoRA kernel launches)
+- v3 forward is 4.1% faster than v2 (SGMV Triton fuses 224 cuBLAS → 112 Triton kernel launches)
 - v3 backward matches v2 (bf16 LoRA gradients, recomputed mid, no large fp32 casts)
-- v1 adds co-serving for +10.9% overhead vs pure peft
-- v2 adds co-serving for +4.7% overhead vs pure peft
-- v3 adds co-serving for +2.2% overhead vs pure peft
+- v0 → v0_compile: decode −20.7% (KV cache), train_fwd −11.2% (CUDA graph)
+- v3 → v3_compile: fused_fwd −20.8% (KV cache shrinks infer from growing seq to 1 token)
 
 **Weight equivalence (step 30):**
 - peft vs v0: max_diff=5.47e-04, ALL PASS
@@ -88,3 +98,18 @@ v2 applies each adapter's LoRA A and B matrices via separate `nn.Linear` calls �
 - `_sgmv_expand_kernel`: fused mid @ B^T for both adapters in one Triton launch, with ADD_INPUTS to accumulate onto base output. Stacked bf16 weights: (2, H_out, R).
 - `FusedLinearSGMV(torch.autograd.Function)`: forward = 1 cuBLAS (fused base) + 2 Triton (shrink + expand). Backward = bf16 LoRA gradients with recomputed train_mid (no large fp32 casts, 4 saved tensors instead of 5), matching v2 backward cost.
 - Pre-allocated bf16 stacked weight buffers (`_buf_cache`), updated via `.copy_()`. Buffers on class attribute (not through autograd) to avoid graph retention.
+
+### v0_compile: torch.compile + KV cache
+- Piecewise CUDA graph: `LlamaAttention.forward` + `create_causal_mask` disabled from compile → attention runs eagerly, MLP/norms get CUDA-graphed.
+- DynamicCache for decode: prefill (step 0) fills cache with full prompt uncompiled, steps 1+ decode 1 token/step via compiled HF forward with `past_key_values`.
+- `torch.compile(model, mode="reduce-overhead")` on the PEFT model — same compiled object for both decode (infer adapter) and train (ft adapter) via `set_adapter()`.
+- Decode static shape: `(1, 1)` input + KV cache. Train static shape: `(1, 300)`.
+
+### v3_compile: v3 SGMV + torch.compile + KV cache
+- Same scalar-arg SGMV Triton kernels as v3.py (2 adapters: infer + ft).
+- KV cache for infer path: `(1, cache_len, num_kv_heads, head_dim)`, grows by 1 token/step.
+- `@torch.compiler.disable` on `attn_forward` (contains flash_attn, SGMV Triton, KV cache mutation).
+- `torch.compile(coserving_forward, mode="reduce-overhead")` → CUDA graph for MLP/norms between disabled attention blocks.
+- Two `fused_linear` variants: `fused_linear_attn` (SGMV + FusedBaseLinear, eager) for attn projections, `fused_linear_mlp` (plain `proj(cat)`, compiled) for MLP + lm_head.
+- Static decode fused shape: `(1, 1+300)` = `(1, 301)` for all decode steps. Prefill shape: `(1, prompt_len+300)`.
+- v3_compile preserves all v3 optimizations: FusedLinearSGMV (bf16 backward, recomputed train_mid), FusedBaseLinear (train-only backward), SGMV kernel launch reduction (224→112 cuBLAS → Triton).
