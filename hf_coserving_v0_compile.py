@@ -26,7 +26,7 @@ torch.cuda.manual_seed(42)
 LlamaAttention.forward = torch.compiler.disable(LlamaAttention.forward)
 _llama_mod.create_causal_mask = torch.compiler.disable(create_causal_mask)
 
-model_name = "meta-llama/Llama-3.2-3B"
+model_name = "meta-llama/Llama-3.1-8B"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token

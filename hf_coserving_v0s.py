@@ -23,7 +23,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 
-MODEL_NAME = "meta-llama/Llama-3.2-3B"
+MODEL_NAME = "meta-llama/Llama-3.1-8B"
 MAX_NEW_TOKENS = 128
 WARMUP_STEPS = 3
 SEQ_LEN = 300
