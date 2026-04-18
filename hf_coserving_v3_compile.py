@@ -1,17 +1,19 @@
 """Fused co-serving v3 with torch.compile piecewise CUDA graph.
 
-Same as hf_coserving_v3.py (SGMV Triton kernels, 2 adapters) but uses:
-  - KV cache for infer path: prefill full prompt, decode 1 token/step
+Same as hf_coserving_v3.py (SGMV Triton kernels, direct adapter access) plus:
+  - KV cache for infer path: prefill full prompt, decode 1 token/step/request
   - @torch.compiler.disable on attn_forward (flash_attn, SGMV Triton, KV cache)
   - torch.compile(coserving_forward, mode="reduce-overhead") -> CUDA graph for MLP/norms
-  - Static fused matmul shape: (1, 1+300, H) = (1, 301, H) for all decode steps
+  - Static fused matmul shape (1, B_i*1 + 300, H) = (1, 302, H) per decode step
   - Prefill (step 0) runs uncompiled, decode (steps 1+) runs compiled
 
 v3 optimizations preserved:
-  - FusedLinearSGMV: SGMV Triton (shrink + expand) for both adapters in attn_forward
-  - FusedBaseLinear: train-only backward for non-LoRA projections (k_proj, o_proj)
-  - bf16 LoRA backward with recomputed train_mid
-  - MLP uses compile-friendly fused_linear_mlp (no custom autograd)
+  - Two inference requests share the "infer" adapter via SGMV segmentation
+    (3 segments → 2 unique adapter slots, no stacking / duplication)
+  - Direct reference to PEFT's infer Parameter storage; only a tiny bf16 buffer
+    for ft (fp32 → bf16 dtype conversion, not a duplicate for batching)
+  - FusedLinearSGMV train-only backward (bf16 LoRA grads, recompute train_mid)
+  - FusedBaseLinear train-only backward for non-LoRA projections
 """
 import time
 import torch
@@ -35,15 +37,17 @@ if tokenizer.pad_token is None:
 model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, device_map="auto",
                                              attn_implementation="flash_attention_2")
 
-# Same 2 adapters as v3: ft (train) + infer (decode)
+# Two LoRA adapters: infer (shared by both inference requests) + ft (training)
 lora_config = LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], lora_dropout=0.0)
 model = get_peft_model(model, lora_config, adapter_name="ft")
 model.add_adapter("infer", lora_config)
 model.set_adapter("ft")
 model.print_trainable_parameters()
 
+# Two inference requests share the prompt and the infer adapter; SGMV
+# batches them as separate segments sharing the SAME adapter slot.
 prompt = "Explain what machine learning is in one sentence."
-input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device).repeat(2, 1)  # (2, L)
 
 max_new_tokens = 128
 warmup_steps = 5
@@ -70,24 +74,26 @@ head_dim = cfg.hidden_size // num_heads
 
 device = model.device
 prompt_len = input_ids.shape[1]
+B_i = input_ids.shape[0]  # 2 inference requests
 num_layers = len(base.layers)
 
-# KV cache for infer path: (1, cache_len, num_kv_heads, head_dim)
+# KV cache for infer path: (B_i, cache_len, num_kv_heads, head_dim)
 _kv_cache_k = [None] * num_layers
 _kv_cache_v = [None] * num_layers
 
 
 # ============================================================================
-# SGMV Triton Kernels — scalar args for 2 adapters (matching v3.py)
+# SGMV Triton Kernels — two adapter pointers, tl.where per-segment selection
 # ============================================================================
 
 @triton.jit
 def _sgmv_shrink_kernel(
-    x_ptr, a_ptr, out_ptr,
-    seg_start_0, seg_len_0, scaling_0,
-    seg_start_1, seg_len_1, scaling_1,
+    x_ptr,
+    a_infer_ptr, a_ft_ptr,
+    out_ptr,
+    seg_starts_ptr, seg_lens_ptr, seg_adapters_ptr, seg_scalings_ptr,
     stride_x_s, stride_x_h,
-    stride_a_a, stride_a_r, stride_a_h,
+    stride_a_r, stride_a_h,
     stride_o_s, stride_o_r,
     HIDDEN: tl.constexpr,
     RANK: tl.constexpr,
@@ -96,16 +102,12 @@ def _sgmv_shrink_kernel(
     BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    adapter_id = tl.program_id(1)
+    seg_id = tl.program_id(1)
 
-    if adapter_id == 0:
-        seg_start = seg_start_0
-        seg_len = seg_len_0
-        scaling = scaling_0
-    else:
-        seg_start = seg_start_1
-        seg_len = seg_len_1
-        scaling = scaling_1
+    seg_start = tl.load(seg_starts_ptr + seg_id)
+    seg_len = tl.load(seg_lens_ptr + seg_id)
+    adapter_id = tl.load(seg_adapters_ptr + seg_id)
+    scaling = tl.load(seg_scalings_ptr + seg_id)
 
     if pid_m * BLOCK_M >= seg_len:
         return
@@ -118,6 +120,7 @@ def _sgmv_shrink_kernel(
     mask_n = offs_n < RANK
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    is_infer = adapter_id == 0
 
     for k in range(0, HIDDEN, BLOCK_K):
         offs_k = k + tl.arange(0, BLOCK_K)
@@ -126,11 +129,11 @@ def _sgmv_shrink_kernel(
             x_ptr + global_m[:, None] * stride_x_s + offs_k[None, :] * stride_x_h,
             mask=mask_m[:, None] & mask_k[None, :], other=0.0,
         )
-        a = tl.load(
-            a_ptr + adapter_id * stride_a_a
-            + offs_k[:, None] * stride_a_h + offs_n[None, :] * stride_a_r,
-            mask=mask_k[:, None] & mask_n[None, :], other=0.0,
-        )
+        a_offs = offs_k[:, None] * stride_a_h + offs_n[None, :] * stride_a_r
+        a_mask = mask_k[:, None] & mask_n[None, :]
+        a_infer = tl.load(a_infer_ptr + a_offs, mask=a_mask, other=0.0)
+        a_ft = tl.load(a_ft_ptr + a_offs, mask=a_mask, other=0.0)
+        a = tl.where(is_infer, a_infer, a_ft)
         acc += tl.dot(x, a)
 
     acc *= scaling
@@ -144,11 +147,12 @@ def _sgmv_shrink_kernel(
 
 @triton.jit
 def _sgmv_expand_kernel(
-    mid_ptr, b_ptr, out_ptr,
-    seg_start_0, seg_len_0,
-    seg_start_1, seg_len_1,
+    mid_ptr,
+    b_infer_ptr, b_ft_ptr,
+    out_ptr,
+    seg_starts_ptr, seg_lens_ptr, seg_adapters_ptr,
     stride_m_s, stride_m_r,
-    stride_b_a, stride_b_h, stride_b_r,
+    stride_b_h, stride_b_r,
     stride_o_s, stride_o_h,
     HIDDEN_OUT: tl.constexpr,
     RANK: tl.constexpr,
@@ -159,14 +163,11 @@ def _sgmv_expand_kernel(
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    adapter_id = tl.program_id(2)
+    seg_id = tl.program_id(2)
 
-    if adapter_id == 0:
-        seg_start = seg_start_0
-        seg_len = seg_len_0
-    else:
-        seg_start = seg_start_1
-        seg_len = seg_len_1
+    seg_start = tl.load(seg_starts_ptr + seg_id)
+    seg_len = tl.load(seg_lens_ptr + seg_id)
+    adapter_id = tl.load(seg_adapters_ptr + seg_id)
 
     if pid_m * BLOCK_M >= seg_len:
         return
@@ -181,15 +182,17 @@ def _sgmv_expand_kernel(
     offs_k = tl.arange(0, BLOCK_K)
     mask_k = offs_k < RANK
 
+    is_infer = adapter_id == 0
+
     mid = tl.load(
         mid_ptr + global_m[:, None] * stride_m_s + offs_k[None, :] * stride_m_r,
         mask=mask_m[:, None] & mask_k[None, :], other=0.0,
     )
-    b = tl.load(
-        b_ptr + adapter_id * stride_b_a
-        + offs_k[:, None] * stride_b_r + offs_n[None, :] * stride_b_h,
-        mask=mask_k[:, None] & mask_n[None, :], other=0.0,
-    )
+    b_offs = offs_k[:, None] * stride_b_r + offs_n[None, :] * stride_b_h
+    b_mask = mask_k[:, None] & mask_n[None, :]
+    b_infer = tl.load(b_infer_ptr + b_offs, mask=b_mask, other=0.0)
+    b_ft = tl.load(b_ft_ptr + b_offs, mask=b_mask, other=0.0)
+    b = tl.where(is_infer, b_infer, b_ft)
 
     acc = tl.dot(mid, b)
 
@@ -204,7 +207,7 @@ def _sgmv_expand_kernel(
 
 
 # ============================================================================
-# Python wrappers + pre-allocated stacked weight buffers (matching v3.py)
+# Python wrappers + minimal bf16 buffer (ft only, for fp32 → bf16 cast)
 # ============================================================================
 
 _BLOCK_M = 32
@@ -213,38 +216,31 @@ _BLOCK_K_SHRINK = 128
 _BLOCK_N_EXPAND = 128
 _BLOCK_K_EXPAND = 16
 
-_buf_cache = {}
+# NO buffer for infer — read directly from PEFT's Parameter storage.
+_ft_buf_cache = {}
 
 
-def _get_bufs(a_shape, b_shape, device):
+def _get_ft_bufs(a_shape, b_shape, device):
     key = (a_shape, b_shape)
-    if key not in _buf_cache:
-        _buf_cache[key] = (
-            torch.empty(2, *a_shape, dtype=torch.bfloat16, device=device),
-            torch.empty(2, *b_shape, dtype=torch.bfloat16, device=device),
+    if key not in _ft_buf_cache:
+        _ft_buf_cache[key] = (
+            torch.empty(*a_shape, dtype=torch.bfloat16, device=device),
+            torch.empty(*b_shape, dtype=torch.bfloat16, device=device),
         )
-    return _buf_cache[key]
+    return _ft_buf_cache[key]
 
 
-def _update_bufs(a_buf, b_buf, a_infer, a_ft, b_infer, b_ft):
-    a_buf[0].copy_(a_infer)
-    a_buf[1].copy_(a_ft)
-    b_buf[0].copy_(b_infer)
-    b_buf[1].copy_(b_ft)
-
-
-def sgmv_shrink(x, a_buf, L_i, L_t, scaling):
+def sgmv_shrink(x, a_infer, a_ft_buf, seg_starts, seg_lens, seg_adapters, seg_scalings, max_seg):
     _, L_total, H = x.shape
-    R = a_buf.shape[1]
+    R = a_infer.shape[0]
     out = torch.empty(1, L_total, R, dtype=x.dtype, device=x.device)
-    max_seg = max(L_i, L_t)
+    n_segs = seg_starts.shape[0]
 
-    _sgmv_shrink_kernel[(triton.cdiv(max_seg, _BLOCK_M), 2)](
-        x, a_buf, out,
-        0, L_i, scaling,
-        L_i, L_t, scaling,
+    _sgmv_shrink_kernel[(triton.cdiv(max_seg, _BLOCK_M), n_segs)](
+        x, a_infer, a_ft_buf, out,
+        seg_starts, seg_lens, seg_adapters, seg_scalings,
         x.stride(1), x.stride(2),
-        a_buf.stride(0), a_buf.stride(1), a_buf.stride(2),
+        a_infer.stride(0), a_infer.stride(1),
         out.stride(1), out.stride(2),
         HIDDEN=H, RANK=R,
         BLOCK_M=_BLOCK_M, BLOCK_N=_BLOCK_N_SHRINK, BLOCK_K=_BLOCK_K_SHRINK,
@@ -252,16 +248,16 @@ def sgmv_shrink(x, a_buf, L_i, L_t, scaling):
     return out
 
 
-def sgmv_expand(mid, b_buf, L_i, L_t, out):
+def sgmv_expand(mid, b_infer, b_ft_buf, seg_starts, seg_lens, seg_adapters, out, max_seg):
     _, L_total, R = mid.shape
-    H_out = b_buf.shape[1]
+    H_out = b_infer.shape[0]
+    n_segs = seg_starts.shape[0]
 
-    _sgmv_expand_kernel[(triton.cdiv(max(L_i, L_t), _BLOCK_M), triton.cdiv(H_out, _BLOCK_N_EXPAND), 2)](
-        mid, b_buf, out,
-        0, L_i,
-        L_i, L_t,
+    _sgmv_expand_kernel[(triton.cdiv(max_seg, _BLOCK_M), triton.cdiv(H_out, _BLOCK_N_EXPAND), n_segs)](
+        mid, b_infer, b_ft_buf, out,
+        seg_starts, seg_lens, seg_adapters,
         mid.stride(1), mid.stride(2),
-        b_buf.stride(0), b_buf.stride(1), b_buf.stride(2),
+        b_infer.stride(0), b_infer.stride(1),
         out.stride(1), out.stride(2),
         HIDDEN_OUT=H_out, RANK=R,
         BLOCK_M=_BLOCK_M, BLOCK_N=_BLOCK_N_EXPAND, BLOCK_K=_BLOCK_K_EXPAND,
@@ -277,11 +273,16 @@ class FusedBaseLinear(torch.autograd.Function):
     """Train-only backward for non-LoRA attn projections (k_proj, o_proj)."""
     @staticmethod
     def forward(ctx, train_x, weight, bias, infer_x):
-        L_i = infer_x.shape[1]
-        combined = torch.cat([infer_x, train_x], dim=1)
+        B_i, L_i, H = infer_x.shape
+        N_i = B_i * L_i
+        infer_flat = infer_x.reshape(1, N_i, H)
+        combined = torch.cat([infer_flat, train_x], dim=1)
         out = F.linear(combined, weight, bias)
         ctx.save_for_backward(weight)
-        return out[:, :L_i], out[:, L_i:]
+        O = out.shape[-1]
+        infer_base = out[:, :N_i].reshape(B_i, L_i, O)
+        train_base = out[:, N_i:]
+        return infer_base, train_base
 
     @staticmethod
     def backward(ctx, grad_infer, grad_train):
@@ -290,32 +291,53 @@ class FusedBaseLinear(torch.autograd.Function):
 
 
 class FusedLinearSGMV(torch.autograd.Function):
-    """Fused base matmul + SGMV LoRA for both adapters, train-only backward.
-    Forward: 1 cuBLAS (base) + 2 Triton (shrink + expand).
-    Backward: bf16 LoRA gradients with recomputed train_mid.
+    """Fused base matmul + SGMV LoRA across N segments; train-only backward.
+    Forward: 1 cuBLAS (base) + 2 Triton (shrink + expand with tl.where routing).
+    Adapter weights accessed via two pointers; infer is read directly from PEFT.
     """
-    _a_buf = None
-    _b_buf = None
+    _a_infer = None   # direct reference to proj.lora_A["infer"].weight (bf16)
+    _b_infer = None   # direct reference to proj.lora_B["infer"].weight (bf16)
+    _a_ft_buf = None  # tiny bf16 buffer for ft (fp32 → bf16 cast only)
+    _b_ft_buf = None
+    _seg_starts = None
+    _seg_lens = None
+    _seg_adapters = None
+    _seg_scalings = None
+    _max_seg = 0
 
     @staticmethod
     def forward(ctx, train_x, infer_x, base_weight, base_bias,
                 A_ft_w, B_ft_w, scaling):
-        L_i = infer_x.shape[1]
+        B_i, L_i, H = infer_x.shape
         L_t = train_x.shape[1]
+        N_i = B_i * L_i
 
-        combined = torch.cat([infer_x, train_x], dim=1)
+        infer_flat = infer_x.reshape(1, N_i, H)
+        combined = torch.cat([infer_flat, train_x], dim=1)
         base_out = F.linear(combined, base_weight, base_bias)
 
-        a_buf = FusedLinearSGMV._a_buf
-        b_buf = FusedLinearSGMV._b_buf
-
-        mid = sgmv_shrink(combined, a_buf, L_i, L_t, scaling)
-        sgmv_expand(mid, b_buf, L_i, L_t, base_out)
+        mid = sgmv_shrink(
+            combined,
+            FusedLinearSGMV._a_infer, FusedLinearSGMV._a_ft_buf,
+            FusedLinearSGMV._seg_starts, FusedLinearSGMV._seg_lens,
+            FusedLinearSGMV._seg_adapters, FusedLinearSGMV._seg_scalings,
+            FusedLinearSGMV._max_seg,
+        )
+        sgmv_expand(
+            mid,
+            FusedLinearSGMV._b_infer, FusedLinearSGMV._b_ft_buf,
+            FusedLinearSGMV._seg_starts, FusedLinearSGMV._seg_lens,
+            FusedLinearSGMV._seg_adapters, base_out,
+            FusedLinearSGMV._max_seg,
+        )
 
         ctx.save_for_backward(train_x, base_weight, A_ft_w, B_ft_w)
         ctx.scaling = scaling
 
-        return base_out[:, :L_i], base_out[:, L_i:]
+        O = base_out.shape[-1]
+        infer_base = base_out[:, :N_i].reshape(B_i, L_i, O)
+        train_base = base_out[:, N_i:]
+        return infer_base, train_base
 
     @staticmethod
     def backward(ctx, grad_infer, grad_train):
@@ -339,7 +361,7 @@ class FusedLinearSGMV(torch.autograd.Function):
 
 # --------------------------------------------------------------------------
 # Two fused_linear variants:
-#   fused_linear_attn: SGMV + FusedBaseLinear (eager, in disabled attn)
+#   fused_linear_attn: SGMV + FusedBaseLinear (eager, inside disabled attn)
 #   fused_linear_mlp:  compile-friendly proj(cat) (compiled MLP + lm_head)
 # --------------------------------------------------------------------------
 
@@ -347,20 +369,18 @@ def fused_linear_attn(proj, infer_x, train_x):
     """SGMV Triton for LoRA (q_proj, v_proj), FusedBaseLinear for non-LoRA (k_proj, o_proj)."""
     if hasattr(proj, 'base_layer'):
         base_layer = proj.base_layer
-        L_i = infer_x.shape[1]
-        L_t = train_x.shape[1]
+        # Direct references to PEFT Parameter storage (no extra copy of infer)
+        a_infer = proj.lora_A["infer"].weight
+        b_infer = proj.lora_B["infer"].weight
+        # Tiny bf16 buffer for ft (dtype cast only)
+        a_ft_buf, b_ft_buf = _get_ft_bufs(a_infer.shape, b_infer.shape, infer_x.device)
+        a_ft_buf.copy_(proj.lora_A["ft"].weight)
+        b_ft_buf.copy_(proj.lora_B["ft"].weight)
 
-        a_buf, b_buf = _get_bufs(
-            proj.lora_A["infer"].weight.shape,
-            proj.lora_B["infer"].weight.shape,
-            infer_x.device,
-        )
-        _update_bufs(a_buf, b_buf,
-                     proj.lora_A["infer"].weight, proj.lora_A["ft"].weight,
-                     proj.lora_B["infer"].weight, proj.lora_B["ft"].weight)
-
-        FusedLinearSGMV._a_buf = a_buf
-        FusedLinearSGMV._b_buf = b_buf
+        FusedLinearSGMV._a_infer = a_infer
+        FusedLinearSGMV._b_infer = b_infer
+        FusedLinearSGMV._a_ft_buf = a_ft_buf
+        FusedLinearSGMV._b_ft_buf = b_ft_buf
 
         infer_out, train_out = FusedLinearSGMV.apply(
             train_x, infer_x,
@@ -377,10 +397,18 @@ def fused_linear_attn(proj, infer_x, train_x):
 
 
 def fused_linear_mlp(proj, infer_x, train_x):
-    """Compile-friendly fused linear for MLP + lm_head."""
-    L_i = infer_x.shape[1]
-    out = proj(torch.cat([infer_x, train_x], dim=1))
-    return out[:, :L_i].detach(), out[:, L_i:]
+    """Compile-friendly fused linear for MLP + lm_head.
+    Flattens (B_i, L_i, H) infer batch into seq dim so base matmul still
+    sees a single (1, B_i*L_i + L_t, H) concatenated tensor.
+    """
+    B_i, L_i, H = infer_x.shape
+    N_i = B_i * L_i
+    infer_flat = infer_x.reshape(1, N_i, H)
+    out = proj(torch.cat([infer_flat, train_x], dim=1))
+    O = out.shape[-1]
+    infer_out = out[:, :N_i].reshape(B_i, L_i, O)
+    train_out = out[:, N_i:]
+    return infer_out.detach(), train_out
 
 
 def rotate_half(x):
@@ -396,18 +424,19 @@ def apply_rope(q, k, cos, sin):
 
 @torch.compiler.disable
 def attn_forward(attn, infer_h, train_h, infer_rope, train_rope, layer_idx):
-    """Flash Attention with SGMV LoRA + KV cache for infer, no KV cache for train."""
-    L_i, L_t = infer_h.shape[1], train_h.shape[1]
+    """Flash Attention with SGMV LoRA + per-request KV cache for infer."""
+    B_i, L_i, _ = infer_h.shape
+    L_t = train_h.shape[1]
 
     infer_q, train_q = fused_linear_attn(attn.q_proj, infer_h, train_h)
     infer_k, train_k = fused_linear_attn(attn.k_proj, infer_h, train_h)
     infer_v, train_v = fused_linear_attn(attn.v_proj, infer_h, train_h)
 
-    # Infer path: (1, L_i, ...) with KV cache
+    # Infer path: (B_i, L_i, ...) with KV cache
     with torch.no_grad():
-        infer_q = infer_q.view(1, L_i, num_heads, head_dim)
-        infer_k = infer_k.view(1, L_i, num_kv_heads, head_dim)
-        infer_v = infer_v.view(1, L_i, num_kv_heads, head_dim)
+        infer_q = infer_q.view(B_i, L_i, num_heads, head_dim)
+        infer_k = infer_k.view(B_i, L_i, num_kv_heads, head_dim)
+        infer_v = infer_v.view(B_i, L_i, num_kv_heads, head_dim)
         cos_i, sin_i = infer_rope
         infer_q, infer_k = apply_rope(infer_q, infer_k, cos_i, sin_i)
 
@@ -418,7 +447,7 @@ def attn_forward(attn, infer_h, train_h, infer_rope, train_rope, layer_idx):
         _kv_cache_v[layer_idx] = infer_v
 
         infer_attn = flash_attn_func(infer_q, infer_k, infer_v, causal=True)
-        infer_attn = infer_attn.reshape(1, L_i, -1)
+        infer_attn = infer_attn.reshape(B_i, L_i, -1)
 
     # Train path: (1, L_t, ...) no KV cache
     train_q = train_q.view(1, L_t, num_heads, head_dim)
@@ -475,6 +504,30 @@ def coserving_forward(infer_ids, train_ids, infer_pos):
     return infer_logits, train_logits
 
 
+def _set_segments(B_i, L_i, L_t, scaling_infer, scaling_ft, device):
+    """Build per-forward SGMV segment metadata and push it onto FusedLinearSGMV.
+
+    Called in the main loop (outside compiled region) so torch.compile never
+    sees the small int32 tensor constructors. The kernels themselves run in
+    the @torch.compiler.disable'd attn_forward path.
+    """
+    starts = [i * L_i for i in range(B_i)] + [B_i * L_i]
+    lens = [L_i] * B_i + [L_t]
+    adapters = [0] * B_i + [1]
+    scalings = [scaling_infer] * B_i + [scaling_ft]
+    FusedLinearSGMV._seg_starts = torch.tensor(starts, dtype=torch.int32, device=device)
+    FusedLinearSGMV._seg_lens = torch.tensor(lens, dtype=torch.int32, device=device)
+    FusedLinearSGMV._seg_adapters = torch.tensor(adapters, dtype=torch.int32, device=device)
+    FusedLinearSGMV._seg_scalings = torch.tensor(scalings, dtype=torch.float32, device=device)
+    FusedLinearSGMV._max_seg = max(L_i, L_t)
+
+
+# Scalings are the same for all LoRA layers; read once.
+_sample_proj = base.layers[0].self_attn.q_proj
+SCALING_INFER = _sample_proj.scaling["infer"]
+SCALING_FT = _sample_proj.scaling["ft"]
+
+
 # --------------------------------------------------------------------------
 # Prefill (step 0, uncompiled)
 # --------------------------------------------------------------------------
@@ -482,8 +535,11 @@ print("[prefill] Running uncompiled step 0 (prefill + train)...")
 model.train()
 
 train_ids_0 = train_all_ids[0:1]
-infer_ids_prefill = input_ids  # (1, prompt_len)
-infer_pos_0 = torch.arange(prompt_len, device=device).unsqueeze(0)
+infer_ids_prefill = input_ids                           # (B_i, prompt_len)
+infer_pos_0 = torch.arange(prompt_len, device=device).unsqueeze(0).expand(B_i, -1)
+
+# Segments for prefill: B_i segments of length prompt_len + 1 train segment
+_set_segments(B_i, prompt_len, train_ids_0.shape[1], SCALING_INFER, SCALING_FT, device)
 
 torch.cuda.synchronize()
 t0 = time.perf_counter()
@@ -491,7 +547,7 @@ infer_logits, train_logits = coserving_forward(infer_ids_prefill, train_ids_0, i
 torch.cuda.synchronize()
 t1 = time.perf_counter()
 
-next_token = infer_logits[0, -1, :].argmax().reshape(1, 1)
+next_token = infer_logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (B_i, 1)
 generated_tokens = [next_token]
 
 shift_logits = train_logits[:, :-1, :].contiguous()
@@ -514,7 +570,7 @@ print(f"[prefill] Done. KV cache shape: {_kv_cache_k[0].shape}")
 # --------------------------------------------------------------------------
 compiled_forward = torch.compile(coserving_forward, mode="reduce-overhead")
 print(f"[compile] reduce-overhead, piecewise (attn_forward disabled)")
-print(f"[compile] Static decode shape: infer=(1, 1), train=(1, 300), fused=(1, 301)")
+print(f"[compile] Static decode shape: infer=({B_i}, 1), train=(1, 300), fused=(1, {B_i*1 + 300})")
 
 # --------------------------------------------------------------------------
 # Decode loop (steps 1+)
@@ -522,12 +578,18 @@ print(f"[compile] Static decode shape: infer=(1, 1), train=(1, 300), fused=(1, 3
 fused_fwd_times = []
 bwd_opt_times = []
 
+# Decode segments: B_i segments of length 1 (one token per request) + train L_t=300.
+# Shape is constant across decode steps → rebuilt each iter but effectively stable.
+DECODE_L_T = train_all_ids.shape[1]
+
 for step in range(1, max_new_tokens):
     model.train()
     train_ids = train_all_ids[step:step+1]
 
-    infer_ids = next_token  # (1, 1)
-    infer_pos = torch.full((1, 1), prompt_len + step - 1, device=device, dtype=torch.long)
+    infer_ids = next_token                              # (B_i, 1)
+    infer_pos = torch.full((B_i, 1), prompt_len + step - 1, device=device, dtype=torch.long)
+
+    _set_segments(B_i, 1, DECODE_L_T, SCALING_INFER, SCALING_FT, device)
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -535,10 +597,10 @@ for step in range(1, max_new_tokens):
     torch.cuda.synchronize()
     t1 = time.perf_counter()
 
-    next_token = infer_logits[0, -1, :].argmax().reshape(1, 1)
+    next_token = infer_logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (B_i, 1)
     generated_tokens.append(next_token)
 
-    if next_token.item() == tokenizer.eos_token_id:
+    if (next_token == tokenizer.eos_token_id).all().item():
         break
 
     shift_logits = train_logits[:, :-1, :].contiguous()
@@ -572,15 +634,17 @@ for step in range(1, max_new_tokens):
 # Output
 # --------------------------------------------------------------------------
 all_tokens = torch.cat([input_ids] + generated_tokens, dim=-1)
-response = tokenizer.decode(all_tokens[0][prompt_len:], skip_special_tokens=True)
-print(f"\n--- Generated response ---\n{response}")
+response_1 = tokenizer.decode(all_tokens[0][prompt_len:], skip_special_tokens=True)
+response_2 = tokenizer.decode(all_tokens[1][prompt_len:], skip_special_tokens=True)
+print(f"\n--- Generated response (request 1) ---\n{response_1}")
+print(f"\n--- Generated response (request 2) ---\n{response_2}")
 
 if fused_fwd_times:
     avg_fused = sum(fused_fwd_times) / len(fused_fwd_times)
     avg_bwd = sum(bwd_opt_times) / len(bwd_opt_times)
     print(f"\n--- Timing (after {warmup_steps} warmup, {len(fused_fwd_times)} measured steps) ---")
-    print(f"  Decode fused shape: (1, 301) = (1, 1 infer + 300 train)")
-    print(f"  KV cache final: {_kv_cache_k[0].shape[1]} tokens x {num_layers} layers")
+    print(f"  Decode fused shape: (1, {B_i*1 + DECODE_L_T}) = (1, {B_i} infer + {DECODE_L_T} train)")
+    print(f"  KV cache final: {_kv_cache_k[0].shape[1]} tokens x {num_layers} layers (batch={B_i})")
     print(f"  avg fused_fwd (decode+peft): {avg_fused*1000:.2f} ms")
     print(f"  avg backward+optimizer:      {avg_bwd*1000:.2f} ms")
     print(f"  avg total:                   {(avg_fused+avg_bwd)*1000:.2f} ms")

@@ -2,14 +2,13 @@
 Co-serving v0s: multiprocessing (spawn) with shared GPU memory via CUDA IPC.
 Schedule: decode || train_fwd (parallel) -> backward+optimizer (sequential)
 
-Decode uses KV cache: prefill at step 0, then single-token decode with
-past_key_values at steps 1+.
+Decode batches N inference requests into ONE forward via gather-BMM:
+shared base-weight matmul, per-sample LoRA applied with stacked A/B weights
+and torch.bmm. Training uses a second adapter (ft).
 
-The decode worker receives model parameters/buffers as CUDA IPC handles, so
-both processes access the SAME physical GPU memory. No model weight duplication.
-
-Worker startup: builds model architecture on CPU (from HuggingFace cache),
-then replaces all parameters and buffers with the shared GPU tensors.
+The per-request adapter list is sent with each decode task (real serving has
+variable batch size / adapter mix per step), and the worker's patched PEFT
+LoraLinear stacks A/B weights on the fly based on that list.
 
 Safety: decode reads base + infer LoRA weights. Forward reads base + ft LoRA
 weights, writes activations (no param mutation). Backward reads base + ft LoRA
@@ -31,7 +30,9 @@ SEQ_LEN = 300
 
 
 def decode_worker(shared_state_q, task_q, result_q):
-    """Decode worker with KV cache. Prefill on first call, then single-token decode."""
+    """Batched decode worker: 2 inference requests fused via gather-BMM."""
+    import peft.tuners.lora.layer as _lora_layer
+
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
@@ -64,7 +65,30 @@ def decode_worker(shared_state_q, task_q, result_q):
             replaced += 1
     print(f"[decode_worker] Replaced {replaced}/{n_shared} tensors with shared GPU memory")
 
-    model.set_adapter("infer")
+    # Gather-BMM: per-step adapter assignment varies across steps (real serving
+    # has different request counts and adapter mixes), so A/B are stacked ON
+    # THE FLY inside the patched forward using step_adapters_ref[0]. The main
+    # process supplies the per-step list with each decode task.
+    step_adapters_ref = [None]  # closure-accessible mutable holder
+
+    _orig_lora_forward = _lora_layer.Linear.forward
+
+    def _patched_lora_forward(self, x, *args, **kwargs):
+        adapters = step_adapters_ref[0]
+        if adapters is not None and not self.disable_adapters and all(a in self.lora_A for a in adapters):
+            A_stack = torch.stack([self.lora_A[a].weight for a in adapters], dim=0)
+            B_stack = torch.stack([self.lora_B[a].weight for a in adapters], dim=0)
+            scaling = self.scaling[adapters[0]]
+            result = self.base_layer(x, *args, **kwargs)
+            orig_dtype = result.dtype
+            x_lora = x.to(A_stack.dtype)
+            mid = torch.bmm(x_lora, A_stack.transpose(1, 2))
+            lora_out = torch.bmm(mid, B_stack.transpose(1, 2))
+            return (result + lora_out * scaling).to(orig_dtype)
+        return _orig_lora_forward(self, x, *args, **kwargs)
+
+    _lora_layer.Linear.forward = _patched_lora_forward
+
     model.eval()
 
     past_key_values = None
@@ -83,20 +107,25 @@ def decode_worker(shared_state_q, task_q, result_q):
 
         with torch.no_grad():
             if op == "prefill":
-                # Prefill: full prompt forward, build KV cache
+                # Prefill: batched (N, L_prompt) forward builds KV cache of batch N
                 input_ids = msg[1].cuda()
+                step_adapters_ref[0] = list(msg[2])
                 out = model(input_ids=input_ids, use_cache=True)
                 past_key_values = out.past_key_values
                 logits = out.logits[:, -1, :]
             else:
-                # Decode: single token with KV cache
+                # Decode: batched (N, 1) token with KV cache
                 cur_token = msg[1].cuda()
-                position_ids = torch.tensor([[msg[2]]], device=cur_token.device)
+                kv_pos = msg[2]
+                step_adapters_ref[0] = list(msg[3])
+                n = len(step_adapters_ref[0])
+                position_ids = torch.tensor([[kv_pos]], device=cur_token.device).expand(n, 1)
                 out = model(input_ids=cur_token, past_key_values=past_key_values,
                             position_ids=position_ids, use_cache=True)
                 past_key_values = out.past_key_values
                 logits = out.logits[:, -1, :]
-            next_token = logits.argmax(dim=-1, keepdim=True)
+            next_token = logits.argmax(dim=-1, keepdim=True)  # (N, 1)
+            step_adapters_ref[0] = None
 
         torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -119,16 +148,16 @@ if __name__ == "__main__":
         attn_implementation="flash_attention_2",
     )
 
-    # Apply two LoRA adapters: one for inference, one for training
+    # 2 LoRA adapters: ft (train) + infer (shared by both inference requests)
     lora_config = LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], lora_dropout=0.0)
     model = get_peft_model(model, lora_config, adapter_name="ft")
     model.add_adapter("infer", lora_config)
     model.set_adapter("ft")
     model.print_trainable_parameters()
 
-    # Inference prompt
+    # Two inference requests share the prompt and the infer adapter; gather-BMM batches them
     prompt = "Explain what machine learning is in one sentence."
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device).repeat(2, 1)
 
     # Pre-tokenize training samples from Alpaca, seq_len=300
     dataset = load_dataset("tatsu-lab/alpaca", split="train")
@@ -141,7 +170,7 @@ if __name__ == "__main__":
     train_all_ids = torch.cat(train_all_ids, dim=0).to(model.device)
 
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-    generated_ids = input_ids.clone()
+    generated_ids = input_ids.clone()  # (2, L)
 
     # Collect shared state: all params + buffers as GPU tensors
     # When sent through Queue, CUDA tensors are serialized as IPC handles
@@ -171,15 +200,14 @@ if __name__ == "__main__":
     train_fwd_times = []
     bwd_opt_times = []
 
-    generated_tokens = []  # tokens generated so far (CPU)
-    # Position of the last token consumed by the KV cache.
-    # After prefill, the cache covers positions 0..prompt_len-1.
+    generated_tokens = []  # list of (2, 1) CPU tensors, batched 2 requests
+    # Position of the last token consumed by the KV cache (same for both samples).
     kv_pos = input_ids.shape[-1] - 1
 
     for step in range(MAX_NEW_TOKENS):
         # ==============================================================
-        # Phase 1: Decode || Train forward (parallel)
-        #   - Decode worker: infer adapter forward with KV cache
+        # Phase 1: Decode (batched 2 via gather-BMM) || Train forward
+        #   - Decode worker: single batched forward covers both requests
         #   - Main process: ft adapter forward (compute loss)
         # ==============================================================
         model.set_adapter("ft")
@@ -189,16 +217,19 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
+        # Per-step adapter assignment (could vary per step in real serving)
+        step_adapters = ["infer", "infer"]
+
         # Dispatch decode to worker (non-blocking)
         if step == 0:
-            # Prefill: send full prompt, worker builds KV cache
-            task_q.put(("prefill", input_ids.cpu()))
-            kv_pos = input_ids.shape[-1] - 1  # cache covers 0..prompt_len-1
+            # Prefill: send full batched prompt + adapter list
+            task_q.put(("prefill", input_ids.cpu(), step_adapters))
+            kv_pos = input_ids.shape[-1] - 1
         else:
-            # Decode: send last generated token + its position
-            last_token = generated_tokens[-1]  # already CPU tensor (1,1)
+            # Decode: send last generated batched token + position + adapter list
+            last_token = generated_tokens[-1]  # CPU (N, 1)
             kv_pos += 1
-            task_q.put(("decode", last_token, kv_pos))
+            task_q.put(("decode", last_token, kv_pos, step_adapters))
 
         # Train forward in main process (runs in parallel with decode worker)
         loss = model(input_ids=train_ids, labels=train_ids).loss
@@ -206,13 +237,13 @@ if __name__ == "__main__":
         t1_fwd = time.perf_counter()
 
         # Wait for decode result
-        next_token, decode_time = result_q.get()
+        next_token, decode_time = result_q.get()  # (2, 1) CPU
         t1 = time.perf_counter()
 
-        generated_tokens.append(next_token)  # CPU tensor (1,1)
+        generated_tokens.append(next_token)
         generated_ids = torch.cat([generated_ids, next_token.to(model.device)], dim=-1)
 
-        if next_token.item() == tokenizer.eos_token_id:
+        if (next_token == tokenizer.eos_token_id).all().item():
             break
 
         # ==============================================================
@@ -252,8 +283,10 @@ if __name__ == "__main__":
     task_q.put(None)
     decode_proc.join()
 
-    response = tokenizer.decode(generated_ids[0][input_ids.shape[-1]:], skip_special_tokens=True)
-    print(f"\n--- Generated response ---\n{response}")
+    response_1 = tokenizer.decode(generated_ids[0][input_ids.shape[-1]:], skip_special_tokens=True)
+    response_2 = tokenizer.decode(generated_ids[1][input_ids.shape[-1]:], skip_special_tokens=True)
+    print(f"\n--- Generated response (request 1) ---\n{response_1}")
+    print(f"\n--- Generated response (request 2) ---\n{response_2}")
 
     if parallel_times:
         avg_par = sum(parallel_times) / len(parallel_times)

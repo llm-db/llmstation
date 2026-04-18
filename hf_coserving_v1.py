@@ -16,16 +16,17 @@ if tokenizer.pad_token is None:
 model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, device_map="auto",
                                              attn_implementation="flash_attention_2")
 
-# Apply two LoRA adapters: one for inference, one for training
+# Two LoRA adapters: infer (shared by both inference requests) + ft (training)
 lora_config = LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], lora_dropout=0.0)
 model = get_peft_model(model, lora_config, adapter_name="ft")
 model.add_adapter("infer", lora_config)
 model.set_adapter("ft")  # only ft adapter requires grad
 model.print_trainable_parameters()
 
-# Inference prompt
+# Two inference requests share the prompt and the infer adapter; gather-BMM
+# batches them into a single (2, L) inference sub-tensor of the fused forward.
 prompt = "Explain what machine learning is in one sentence."
-input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device).repeat(2, 1)  # (2, L)
 
 max_new_tokens = 128
 warmup_steps = 3
@@ -53,45 +54,51 @@ n_rep = num_heads // num_kv_heads
 
 prompt_len = input_ids.shape[1]
 num_layers = len(base.layers)
-_kv_cache_k = [None] * num_layers
+_kv_cache_k = [None] * num_layers  # each (B_i, kv_len, num_kv_heads, head_dim)
 _kv_cache_v = [None] * num_layers
+
+# Per-step adapter list (decided per decode step, varies in real serving)
+GBMM_STEP_ADAPTERS = None  # list of adapter names, one per inference batch slot
 
 
 # --------------------------------------------------------------------------
-# Matrix-level fusion with Flash Attention: for each Linear projection,
-# cat inference + training along seq dim -> single matmul -> split -> detach
-# inference. Non-parametric ops (RoPE, FlashAttn, SiLU) run separately.
+# Matrix-level fusion with Flash Attention: infer (B_i, L_i, H) is flattened
+# to (1, B_i*L_i, H) and concatenated with train (1, L_t, H) along seq dim
+# for a single base matmul (one HBM weight read). Infer LoRA uses gather-BMM
+# with per-slot adapters from GBMM_STEP_ADAPTERS; train LoRA uses ft.
 # --------------------------------------------------------------------------
 
 def fused_linear(proj, infer_x, train_x):
-    """
-    Fused base weight load (one HBM read) + separate LoRA adapters.
-    For LoRA layers (q_proj, v_proj): base fused, adapters separate.
-    For regular layers (k_proj, o_proj, mlp, lm_head): fully fused.
-    """
-    L_i = infer_x.shape[1]
+    B_i, L_i, H = infer_x.shape
+    infer_flat = infer_x.reshape(1, B_i * L_i, H)
 
     if hasattr(proj, 'base_layer'):
         # LoRA layer: fuse base weight, apply separate adapters
-        base_out = proj.base_layer(torch.cat([infer_x, train_x], dim=1))
-        infer_base = base_out[:, :L_i]
-        train_base = base_out[:, L_i:]
-
-        # LoRA weights may differ in dtype from activations; cast to match each adapter
-        infer_lora_dtype = proj.lora_A["infer"].weight.dtype
-        ft_lora_dtype = proj.lora_A["ft"].weight.dtype
+        base_out = proj.base_layer(torch.cat([infer_flat, train_x], dim=1))
+        infer_base = base_out[:, :B_i * L_i].reshape(B_i, L_i, -1)
+        train_base = base_out[:, B_i * L_i:]
         act_dtype = infer_base.dtype
 
-        # Inference adapter (no dropout for eval)
-        infer_lora = proj.lora_B["infer"](proj.lora_A["infer"](infer_x.to(infer_lora_dtype))) * proj.scaling["infer"]
-        # Training adapter (with dropout)
+        # Infer LoRA: gather-BMM, A/B stacked on the fly per current adapter list
+        adapters = GBMM_STEP_ADAPTERS
+        A_stack = torch.stack([proj.lora_A[a].weight for a in adapters], dim=0)  # (B_i, R, H)
+        B_stack = torch.stack([proj.lora_B[a].weight for a in adapters], dim=0)  # (B_i, O, R)
+        scaling = proj.scaling[adapters[0]]
+        infer_x_lora = infer_x.to(A_stack.dtype)
+        mid = torch.bmm(infer_x_lora, A_stack.transpose(1, 2))        # (B_i, L_i, R)
+        infer_lora = torch.bmm(mid, B_stack.transpose(1, 2)) * scaling  # (B_i, L_i, O)
+
+        # Train LoRA: ft adapter via standard PEFT path
+        ft_lora_dtype = proj.lora_A["ft"].weight.dtype
         train_lora = proj.lora_B["ft"](proj.lora_A["ft"](proj.lora_dropout["ft"](train_x).to(ft_lora_dtype))) * proj.scaling["ft"]
 
         return (infer_base + infer_lora.to(act_dtype)).detach(), train_base + train_lora.to(act_dtype)
     else:
         # Regular linear: just fuse
-        out = proj(torch.cat([infer_x, train_x], dim=1))
-        return out[:, :L_i].detach(), out[:, L_i:]
+        out = proj(torch.cat([infer_flat, train_x], dim=1))
+        infer_out = out[:, :B_i * L_i].reshape(B_i, L_i, -1)
+        train_out = out[:, B_i * L_i:]
+        return infer_out.detach(), train_out
 
 
 def rotate_half(x):
@@ -100,23 +107,24 @@ def rotate_half(x):
 
 
 def apply_rope(q, k, cos, sin):
-    """Apply RoPE. q/k shape: (batch, seqlen, nheads, head_dim)"""
-    cos = cos.unsqueeze(2)  # (1, seqlen, 1, head_dim)
-    sin = sin.unsqueeze(2)  # (1, seqlen, 1, head_dim)
+    """Apply RoPE. q/k shape: (B, L, nheads, head_dim); cos/sin: (B, L, head_dim)."""
+    cos = cos.unsqueeze(2)
+    sin = sin.unsqueeze(2)
     return (q * cos + rotate_half(q) * sin), (k * cos + rotate_half(k) * sin)
 
 
 def attn_forward(attn, infer_h, train_h, infer_rope, train_rope, layer_idx):
-    L_i, L_t = infer_h.shape[1], train_h.shape[1]
+    B_i, L_i, _ = infer_h.shape
+    L_t = train_h.shape[1]
     infer_q, train_q = fused_linear(attn.q_proj, infer_h, train_h)
     infer_k, train_k = fused_linear(attn.k_proj, infer_h, train_h)
     infer_v, train_v = fused_linear(attn.v_proj, infer_h, train_h)
 
-    # Infer path: KV cache
+    # Infer path: per-request KV cache (batch B_i)
     with torch.no_grad():
-        infer_q = infer_q.view(1, L_i, num_heads, head_dim)
-        infer_k = infer_k.view(1, L_i, num_kv_heads, head_dim)
-        infer_v = infer_v.view(1, L_i, num_kv_heads, head_dim)
+        infer_q = infer_q.view(B_i, L_i, num_heads, head_dim)
+        infer_k = infer_k.view(B_i, L_i, num_kv_heads, head_dim)
+        infer_v = infer_v.view(B_i, L_i, num_kv_heads, head_dim)
         cos_i, sin_i = infer_rope
         infer_q, infer_k = apply_rope(infer_q, infer_k, cos_i, sin_i)
 
@@ -127,7 +135,7 @@ def attn_forward(attn, infer_h, train_h, infer_rope, train_rope, layer_idx):
         _kv_cache_v[layer_idx] = infer_v
 
         infer_attn = flash_attn_func(infer_q, infer_k, infer_v, causal=True)
-        infer_attn = infer_attn.reshape(1, L_i, -1)
+        infer_attn = infer_attn.reshape(B_i, L_i, -1)
 
     # Train path: no KV cache
     train_q = train_q.view(1, L_t, num_heads, head_dim)
@@ -160,6 +168,7 @@ def mlp_forward(layer, infer_h, train_h):
 
 
 def coserving_forward(infer_ids, train_ids, infer_pos):
+    # infer_ids: (B_i, L_i), train_ids: (1, L_t), infer_pos: (B_i, L_i)
     infer_h = base.embed_tokens(infer_ids).detach()
     train_h = base.embed_tokens(train_ids)
 
@@ -191,21 +200,24 @@ def coserving_forward(infer_ids, train_ids, infer_pos):
 # --------------------------------------------------------------------------
 
 device = input_ids.device
+B_i = input_ids.shape[0]  # 2 inference requests
 fused_fwd_times = []
 bwd_opt_times = []
 
 # Prefill (step 0)
 model.train()
 train_ids_0 = train_all_ids[0:1]
-infer_pos_0 = torch.arange(prompt_len, device=device).unsqueeze(0)
+infer_pos_0 = torch.arange(prompt_len, device=device).unsqueeze(0).expand(B_i, -1)
 
+GBMM_STEP_ADAPTERS = ["infer"] * B_i  # both slots use infer
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 infer_logits, train_logits = coserving_forward(input_ids, train_ids_0, infer_pos_0)
 torch.cuda.synchronize()
 t1 = time.perf_counter()
+GBMM_STEP_ADAPTERS = None
 
-next_token = infer_logits[0, -1, :].argmax().reshape(1, 1)
+next_token = infer_logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (B_i, 1)
 generated_tokens = [next_token]
 
 shift_logits = train_logits[:, :-1, :].contiguous()
@@ -226,18 +238,21 @@ print(f"step   0 | loss={loss.item():.4f} | fused_fwd={t1-t0:.4f}s | bwd+opt={t3
 for step in range(1, max_new_tokens):
     model.train()
     train_ids = train_all_ids[step:step+1]
-    infer_pos = torch.full((1, 1), prompt_len + step - 1, device=device, dtype=torch.long)
+    infer_pos = torch.full((B_i, 1), prompt_len + step - 1, device=device, dtype=torch.long)
+    step_adapters = ["infer"] * B_i  # per-step list (could vary in real serving)
 
+    GBMM_STEP_ADAPTERS = step_adapters
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     infer_logits, train_logits = coserving_forward(next_token, train_ids, infer_pos)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
+    GBMM_STEP_ADAPTERS = None
 
-    next_token = infer_logits[0, -1, :].argmax().reshape(1, 1)
+    next_token = infer_logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (B_i, 1)
     generated_tokens.append(next_token)
 
-    if next_token.item() == tokenizer.eos_token_id:
+    if (next_token == tokenizer.eos_token_id).all().item():
         break
 
     shift_logits = train_logits[:, :-1, :].contiguous()
@@ -268,8 +283,10 @@ for step in range(1, max_new_tokens):
         print(f"step {step:3d} | loss={loss.item():.4f} | fused_fwd={t1-t0:.4f}s | bwd+opt={t3-t2:.4f}s")
 
 all_tokens = torch.cat([input_ids] + generated_tokens, dim=-1)
-response = tokenizer.decode(all_tokens[0][prompt_len:], skip_special_tokens=True)
-print(f"\n--- Generated response ---\n{response}")
+response_1 = tokenizer.decode(all_tokens[0][prompt_len:], skip_special_tokens=True)
+response_2 = tokenizer.decode(all_tokens[1][prompt_len:], skip_special_tokens=True)
+print(f"\n--- Generated response (request 1) ---\n{response_1}")
+print(f"\n--- Generated response (request 2) ---\n{response_2}")
 
 if fused_fwd_times:
     avg_fused = sum(fused_fwd_times) / len(fused_fwd_times)

@@ -1,9 +1,10 @@
+# Python 3.14.3
+# MAX_JOBS=4 pip install flash-attn==2.8.3 --no-build-isolation
 torch==2.11.0
 transformers==5.5.0
 accelerate==1.13.0
 peft==0.18.1
 datasets==4.8.4
 ninja==1.13.0
-flash-attn==2.8.3
 einops==0.8.2
 triton==3.6.0

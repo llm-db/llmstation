@@ -1,116 +1,153 @@
 ## Project: LLMStation Fusion Engine
 
-Benchmarking co-serving (simultaneous inference + LoRA fine-tuning) on a single GPU.
+Benchmarking co-serving (simultaneous multi-request inference + LoRA fine-tuning) on a single GPU.
 
-**Model:** meta-llama/Llama-3.2-3B, bf16
-**GPU:** NVIDIA L4 (22GB), 64-core CPU, 251GB RAM
-**Conda env:** llmstation (Python 3.14.3, PyTorch 2.11.0+cu130)
-**Attention:** All files use Flash Attention 2 (flash-attn 2.8.3)
+- **Model:** meta-llama/Llama-3.2-3B, bf16
+- **GPU:** NVIDIA L4 (22GB), 64-core CPU, 251GB RAM
+- **Conda env:** llmstation (Python 3.14.3, PyTorch 2.11.0+cu130)
+- **Attention:** All files use Flash Attention 2 (flash-attn 2.8.3)
+
+## Workload (all co-serving variants)
+
+Per step:
+- **2 inference requests** sharing the single "infer" LoRA adapter (batch dim 2 in decode)
+- **1 LoRA training step** on the "ft" adapter (seq_len=300, Alpaca)
+- Inference uses a KV cache; training has no cache
+- Per-step adapter routing is decided dynamically (no pre-built adapter caches), mirroring real multi-tenant serving where the request count / adapter mix varies across steps
 
 ## Files
 
 | File | Role |
 |------|------|
-| `hf_inference.py` | Pure inference benchmark (128 decode steps, `attn_implementation="flash_attention_2"`) |
-| `hf_peft.py` | Pure LoRA training benchmark (128 steps, Alpaca, seq_len=300, `attn_implementation="flash_attention_2"`) |
-| `hf_coserving_v0.py` | Naive co-serving: alternates decode (infer adapter) and train (ft adapter) separately (`attn_implementation="flash_attention_2"`) |
-| `hf_coserving_v0s.py` | Multiprocessing co-serving: spawn + CUDA IPC shared GPU memory, decode \|\| train_fwd (parallel) → bwd+opt (sequential) |
-| `hf_coserving_v1.py` | Fused co-serving: manual forward with matrix-level fusion (one HBM weight read for both paths), `attn_implementation="flash_attention_2"` + `flash_attn_func` directly |
-| `hf_coserving_v2.py` | Fused co-serving + custom backward: same fused forward as v1, but `FusedBaseLinear` autograd Function skips inference tokens in backward (train-only gradient) |
-| `hf_coserving_v3.py` | Fused co-serving + SGMV Triton kernels: replaces 4 cuBLAS LoRA calls per projection with 2 Triton kernel launches (shrink + expand) for both adapters, custom backward preserved |
-| `hf_coserving_v0_compile.py` | v0 + torch.compile piecewise CUDA graph + KV cache for decode (DynamicCache, 1 token/step) |
-| `hf_coserving_v3_compile.py` | v3 + torch.compile piecewise CUDA graph + KV cache for infer path, static fused shape (1, 301, H) |
-| `compare_weights.py` | Compares step-30 LoRA checkpoints across peft/v0/v0s/v1/v2/v3 |
+| `hf_inference.py` | Pure inference benchmark (reference) |
+| `hf_peft.py` | Pure LoRA training benchmark (reference, seq_len=300) |
+| `hf_coserving_v0.py` | Naive co-serving: batched 2-request decode via **gather-BMM** (per-step dynamic adapter stacking monkey-patched into PEFT's LoraLinear) + separate PEFT training step |
+| `hf_coserving_v0s.py` | v0 + multiprocessing (spawn + CUDA IPC): batched decode in worker ‖ train_fwd in main process, then bwd+opt sequentially |
+| `hf_coserving_v1.py` | Matrix-level fusion: infer `(B_i, L_i, H)` flattened and concatenated with train `(1, L_t, H)` for a single base matmul; infer LoRA via **gather-BMM**, train LoRA via ft adapter |
+| `hf_coserving_v2.py` | v1 + `FusedBaseLinear` custom autograd: train-only backward skips the `B_i*L_i` infer tokens |
+| `hf_coserving_v3.py` | v2 fusion + **SGMV Triton kernels** (shrink + expand). 3 segments (2 infer + 1 train) → 2 unique adapter slots. Infer adapter read directly from PEFT `Parameter` storage (no stacking, no per-request duplication); only a minimal bf16 buffer for ft's fp32→bf16 dtype cast. Per-segment metadata passed as int32/fp32 tensors |
+| `hf_coserving_v0_compile.py` | v0 + `torch.compile(mode="reduce-overhead")` piecewise CUDA graph + DynamicCache batch=2 |
+| `hf_coserving_v3_compile.py` | v3 + torch.compile + KV cache; attn disabled from compile (SGMV + flash_attn run eagerly), MLP/norms/embed/lm_head compiled with static fused shape `(1, 2+300)` |
+| `compare_weights.py` | Compares step-30 ft-adapter checkpoints across peft/v0/v0s/v0_compile/v1/v2/v3/v3_compile |
 | `requirements.txt` | torch, transformers, accelerate, peft, datasets, ninja, flash-attn, einops, triton |
 
-## LoRA config (all training files)
+## LoRA config
 - r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], lora_dropout=0.0
-- v0/v0s/v1/v2/v3 use dual adapters: "ft" (train, grad) + "infer" (decode, no_grad)
+- Two adapters on all co-serving files:
+  - **"infer"** — shared by both inference requests (frozen, bf16)
+  - **"ft"** — training adapter (trainable, stored fp32 for optimizer precision)
 
-## Key results (128 steps, seq_len=300)
+## Key results (128 steps, 2 inference requests + 1 training step/iter, seq_len=300)
 
-**Speed (avg per step, ms):**
+**Speed (avg per step, ms):** Non-compile warmup=3, compile warmup=5.
 
-All versions use KV cache for decode. Non-compile: after 3 warmup. Compile: after 5 warmup + CUDA graph.
+| Version | decode / fused_fwd | train_fwd | bwd+opt | total | vs baseline |
+|---------|--------------------|-----------|---------|-------|-------------|
+| inference (1 req, KV cache) | 31.23 | — | — | 31.23 | (ref) |
+| peft (train only) | — | 63.14 | 72.96 | 136.10 | (ref) |
+| v0 (gather-BMM naive) | 34.74 | 58.35 | 72.98 | 166.07 | baseline |
+| v0s (gather-BMM, decode‖train) | parallel wall 97.74 | — | 72.15 | 169.89 | +2.3% |
+| v1 (gather-BMM + fusion) | 62.88 | — | 72.47 | 135.36 | −18.5% |
+| v2 (+ train-only backward) | 63.56 | — | 70.94 | 134.50 | −19.0% |
+| v3 (SGMV, direct infer access) | 59.82 | — | 69.48 | **129.31** | −22.1% |
+| v0_compile (gather-BMM + compile) | 32.31 | 54.16 | 68.75 | 155.22 | baseline_c |
+| v3_compile (SGMV + compile) | 55.18 | — | 65.27 | **120.46** | −22.4% |
 
-| Version | decode | train_fwd | fused_fwd | bwd+opt | total | vs baseline |
-|---------|--------|-----------|-----------|---------|-------|-------------|
-| inference | 31.21 | — | — | — | 31.21 | (ref) |
-| peft | — | — | 64.76 | 74.56 | 139.32 | (ref) |
-| v0 | 33.61 | 58.01 | — | 71.91 | 163.52 | baseline |
-| v0s | wall 97.31 | (parallel) | — | 69.84 | 167.14 | +2.2% |
-| v1 | — | — | 63.45 | 73.17 | 136.62 | −16.5% |
-| v2 | — | — | 63.64 | 71.58 | 135.23 | −17.3% |
-| v3 | — | — | 61.44 | 72.09 | 133.53 | −18.3% |
-| v0_compile | 33.12 | 52.83 | — | 65.11 | 151.06 | baseline_c |
-| v3_compile | — | — | 55.75 | 66.39 | 122.13 | −19.1% |
+Notes:
+- Baselines: **v0** (non-compile) and **v0_compile** (compile). peft is a training-only reference and is not treated as a baseline.
+- In v0/v0s/v0_compile the decode is a standalone batched `(2, 1)` forward and train_fwd is a separate call; in v1/v2/v3/v3_compile both are concatenated into one fused matmul (`fused_fwd`).
+- v0s loses vs v0 sequential: HBM contention inflates both decode and train_fwd ~1.5–2× when run in parallel, eating more time than the overlap saves.
+- v3 is the fastest non-compile variant (−22.1% vs v0); v3_compile is the fastest overall (−22.4% vs v0_compile).
 
-- Baselines: v0 (naive co-serving) and v0_compile (naive + compile). inference/peft are reference only.
-- peft_compile = v0_compile train_fwd + bwd = 117.94 ms (same compiled HF forward with ft adapter)
-- v0s parallel overlap: decode (94.22) || train_fwd (96.60), wall=97.31. HBM contention inflates each op ~2.8×, net slower than v0.
-- v2 backward is 2.2% faster than v1 (skips 1 infer token in backward, small with KV cache)
-- v3 forward is 3.5% faster than v2 (SGMV Triton fuses 224 cuBLAS → 112 Triton kernel launches)
-- v3 backward matches v2 (bf16 LoRA gradients, recomputed mid, no large fp32 casts)
-- v0 → v0_compile: train_fwd −8.9% + bwd −9.5% (CUDA graph)
-- v3 → v3_compile: fused_fwd −9.3% + bwd −7.9% (CUDA graph)
+**Weight equivalence (step-30 ft-adapter params vs pure peft, atol=5e-3):**
 
-**Weight equivalence (step 30):**
-- peft vs v0: max_diff=4.93e-04, ALL PASS
-- peft vs v0s: max_diff=4.90e-04, ALL PASS
-- peft vs v1: max_diff=7.44e-04, ALL PASS
-- peft vs v2: max_diff=4.54e-04, ALL PASS
-- peft vs v3: max_diff=6.47e-04, ALL PASS
-- v2 vs v3: max_diff=5.12e-04, ALL PASS
-- All 112 LoRA params within atol=5e-3
+| Comparison | max_diff | Status |
+|---|---|---|
+| peft vs v0 | 6.29e-04 | ALL PASS |
+| peft vs v0s | 4.91e-04 | ALL PASS |
+| peft vs v0_compile | 2.13e-03 | ALL PASS |
+| peft vs v1 | 8.72e-04 | ALL PASS |
+| peft vs v2 | 9.39e-04 | ALL PASS |
+| peft vs v3 | 1.43e-03 | ALL PASS |
+| peft vs v3_compile | 1.95e-03 | ALL PASS |
+| v2 vs v3 | 1.35e-03 | ALL PASS |
+| v3 vs v3_compile | 2.06e-03 | ALL PASS |
 
-**Loss (step 30):** peft=0.9056, v0=0.9042, v0s=0.9066, v1=0.9062, v2=0.9023, v3=0.9062
+All 112 trainable LoRA params within atol=5e-3 across every variant.
 
 ## Why each version is faster than the previous
 
-### v0s: multiprocessing with shared GPU (decode || train_fwd parallel, +3.97 ms vs v0)
-v0s uses Python multiprocessing (spawn) with CUDA IPC to share the same physical GPU tensors between two processes. Both decode (infer adapter) and train_forward (ft adapter) run in parallel, then backward+optimizer runs sequentially. The 36.7% overlap saving is real, but HBM bandwidth contention between the two processes inflates each operation ~2.5× (decode: 104.38 vs 41.79 ms solo, train_fwd: 107.25 vs 59.50 ms solo). Net result: 178.88 ms, slightly slower than v0's 174.91 ms sequential. This demonstrates that co-execution of memory-bound kernels cannot beat sequential execution.
+### v0s: multiprocessing with shared GPU (still slower than v0)
+Spawn + CUDA IPC puts two processes on the same physical GPU memory and runs the batched 2-request decode in parallel with train_fwd. The overlap saving is real (~29% vs sequential), but HBM contention inflates each op substantially (decode 34.7 → 70.8 ms, train_fwd 58.4 → 97.0 ms), so net wall time ends up slightly above v0.
 
-### v0 → v1: matrix-level fusion (−20.35 ms, −11.6%)
-v0 runs inference and training as two completely separate forward passes, reading every base weight matrix from HBM twice per layer. v1 concatenates inference and training tokens along the sequence dimension (`torch.cat`) and performs a single base weight matmul for both paths. This halves HBM bandwidth for the dominant base-weight loads (3072×3072 per projection). The fused forward (73.70 ms) is slower than v0's decode alone (41.79 ms) but replaces both decode + train_fwd (41.79 + 59.50 = 101.29 ms), saving 27.59 ms in forward. The backward is slightly slower (80.87 vs 73.62 ms) because autograd still processes the full concatenated (L_i + L_t) dimension.
+### v0 → v1: matrix-level fusion (−30.7 ms, −18.5% vs v0)
+v0 runs decode and train as fully separate forward passes — every base weight matrix is read from HBM twice per layer. v1 flattens the inference batch `(2, L_i, H) → (1, 2*L_i, H)` and concatenates with the training tokens `(1, L_t, H)` along the sequence dim for a single base-weight matmul covering both. Halves HBM bandwidth on the dominant base-weight loads. Infer LoRA uses gather-BMM; train LoRA keeps the ft adapter via PEFT.
 
-### v1 → v2: custom backward skips inference tokens (−8.67 ms, −5.6%)
-v1's autograd backward computes gradients for the full (L_i + L_t) concatenated input even though inference gradients are zero (the infer path is detached). `FusedBaseLinear(torch.autograd.Function)` keeps the same fused forward but overrides backward to only compute `grad_train @ weight` on the L_t training tokens, completely skipping the L_i inference tokens. This makes backward cost match v0's pure-training backward (72.48 vs 73.62 ms) while keeping v1's fused forward. The saving grows with the L_i/L_t ratio.
+### v1 → v2: train-only backward (−0.86 ms, −0.6% vs v1)
+v1's autograd backward still processes the full `(2*L_i + L_t)` dimension even though infer contributes zero gradient. `FusedBaseLinear(torch.autograd.Function)` keeps v1's fused forward but overrides backward to compute only `grad_train @ W` on the `L_t` training tokens, skipping the `2*L_i` infer tokens entirely. Savings are small here because L_t=300 dominates but would grow with the infer/train ratio.
 
-### v2 → v3: SGMV Triton kernels + bf16 backward (−3.57 ms, −2.4%)
-v2 applies each adapter's LoRA A and B matrices via separate `nn.Linear` calls — 4 cuBLAS kernel launches per LoRA projection (A_infer, B_infer, A_ft, B_ft), plus Python-side dtype casts and scaling ops. With 56 LoRA projections (28 layers × 2 modules), that is 224 small cuBLAS launches per forward. v3 replaces these with 2 custom Triton kernel launches per projection (shrink: x @ A^T × scaling, expand: mid @ B^T + base_out), each processing both adapters in parallel via grid dim = adapter_id with stacked weight tensors (2, R, H) / (2, H_out, R). Pre-allocated bf16 stacked buffers (keyed by weight shape) are updated in-place via `.copy_()`, avoiding per-call `torch.stack` allocation. This reduces total kernel launches from 224 to 112 per forward, cutting forward time by 4.1% (70.39 vs 73.41 ms). The backward uses bf16 LoRA gradient computation with recomputed train_mid (avoiding 168 large fp32 casts per backward and 56 extra saved tensors in the autograd graph), matching v2's backward cost (71.93 vs 72.48 ms).
+### v2 → v3: SGMV with direct adapter access (−5.2 ms, −3.9% vs v2)
+Two complementary properties of SGMV over gather-BMM:
+
+1. **No per-request weight duplication.** Gather-BMM needs to stack the infer adapter weight as many times as there are inference requests (`(B_i, R, H)` for the A matrix). SGMV stores each unique adapter once, and N segments route to K ≤ N unique slots. With 2 infer requests sharing one "infer" adapter, K=2 total unique slots (infer + ft) — not 3.
+2. **No extra materialized copy of the infer adapter at all.** The Triton kernel receives `proj.lora_A["infer"].weight.data_ptr()` directly. The only remaining copy is a tiny one-shape bf16 buffer for the ft adapter, needed because PEFT stores ft in fp32 and the kernel reads bf16 — this is a dtype-conversion buffer, not a duplicate for batching.
+
+Each shrink / expand kernel takes two adapter pointers (`a_infer_ptr`, `a_ft_bf16_ptr`) and uses `tl.where(adapter_id == 0, a_infer_tile, a_ft_tile)` at block granularity to route. Still 2 Triton launches per LoRA projection regardless of request count. Forward drops ~3.7 ms; backward drops ~1.5 ms (bf16 LoRA grads with recomputed `train_mid`, matching v2 cost).
+
+### v0 → v0_compile: compile applied to the non-compile baseline (−10.85 ms, −6.5% vs v0)
+Same batched-decode + separate-train structure as v0, but with `torch.compile(mode="reduce-overhead")` + DynamicCache. Attention and mask creation run eagerly, everything else gets CUDA-graphed. Sets the compile baseline at 155.22 ms.
+
+### v3 → v3_compile: compile applied to the best non-compile variant (−8.85 ms, −6.8% vs v3; −22.4% vs v0_compile)
+Attention (flash_attn + SGMV + KV cache mutation) stays eager via `@torch.compiler.disable`. Embed, layernorms, MLP, lm_head all compile into CUDA graphs with static fused shape `(1, 2 + 300) = (1, 302)` and static decode input `(2, 1)`. Segment tensors are built in the main loop (outside the compiled region) so Dynamo never sees `torch.tensor([...])`; kernels execute in the disabled attn path.
 
 ## Architecture notes
 
+### Gather-BMM (v0 / v0s / v0_compile / v1 / v2)
+Batched per-request LoRA for N inference slots:
+- For v0 / v0s / v0_compile: monkey-patch `peft.tuners.lora.layer.Linear.forward`. For v1 / v2: call directly inside the custom `fused_linear`.
+- Before each decode forward, set `GBMM_STEP_ADAPTERS = [...]` (one adapter name per slot; varies per step).
+- Inside the patched / custom forward, stack on the fly:
+  - `A_stack = torch.stack([proj.lora_A[a].weight for a in adapters], dim=0)` → `(N, R, H)`
+  - `B_stack = torch.stack([proj.lora_B[a].weight for a in adapters], dim=0)` → `(N, O, R)`
+- Per-sample BMM: `mid = bmm(x, A_stack.transpose(1,2))`; `lora = bmm(mid, B_stack.transpose(1,2)) * scaling`.
+- Limitation: when M slots share the same adapter, its weight is materialized M times in the stack.
+
+### SGMV direct (v3 / v3_compile)
+Segment-based routing with direct adapter pointers:
+- Per forward, build 4 tensors: `seg_starts`, `seg_lens`, `seg_adapters`, `seg_scalings` (one entry per segment, on GPU). For the current workload that's 3 entries (2 infer segments pointing at adapter 0, 1 train segment pointing at adapter 1).
+- Infer adapter: `proj.lora_A["infer"].weight` / `proj.lora_B["infer"].weight` passed to the kernel as-is (bf16, no copy).
+- Ft adapter: tiny `(R, H)` / `(O, R)` bf16 buffer per shape in `_ft_buf_cache`, updated per forward via `.copy_(ft.weight)` to convert fp32 → bf16.
+- Triton kernels take two adapter pointers; `tl.where(adapter_id == 0, a_infer, a_ft)` selects per block.
+- Shrink grid: `(cdiv(max_seg, BLOCK_M), n_segs)`. Expand grid: `(cdiv(max_seg, BLOCK_M), cdiv(H_out, BLOCK_N), n_segs)`. `n_segs` is passed at launch time so the structure scales with request count.
+- `FusedLinearSGMV(torch.autograd.Function)`: forward = 1 cuBLAS (fused base matmul) + 2 Triton. Backward = bf16 LoRA gradient with recomputed `train_mid` (no large fp32 casts, 4 saved tensors).
+
+### v1 / v2 fusion (matrix level, gather-BMM LoRA)
+- `fused_linear(proj, infer_x, train_x)`:
+  - `infer_flat = infer_x.reshape(1, B_i*L_i, H)` → cat with `train_x` along seq dim.
+  - Single base matmul on `(1, B_i*L_i + L_t, H)`.
+  - Gather-BMM LoRA for the infer segments, PEFT ft path for train.
+  - Split back: `infer_base[:, :B_i*L_i].reshape(B_i, L_i, O)` / `train_base[:, B_i*L_i:]`.
+- `attn_forward`: fused Q/K/V/O projections; separate RoPE + `flash_attn_func` for infer (batch `B_i`) and train (batch 1).
+- `mlp_forward`: fused gate/up/down, SiLU activation separately.
+- KV cache per layer: `(B_i, kv_len, num_kv_heads, head_dim)`; grows by `L_i` per step.
+- v2 replaces the fused base matmul with `FusedBaseLinear(torch.autograd.Function)` whose backward only propagates through the train slice of the concatenated tensor.
+
 ### v0s multiprocessing
-- Spawn start method + CUDA IPC handles for shared GPU memory (480 tensors: params + buffers)
-- Decode worker: builds model architecture on CPU from HF cache, replaces all params/buffers with shared GPU tensors via `param.data = shared_state[name]`
-- Schedule: dispatch decode to worker (non-blocking) + run train_forward in main process simultaneously → wait for both → backward+optimizer in main process
+- Spawn + CUDA IPC to share ~480 tensors (params + buffers) between processes — both reference the same physical GPU memory.
+- Decode worker: builds the model on CPU, then rebinds every `param.data` / `buf.data` to the shared GPU tensor; also monkey-patches PEFT's LoraLinear for gather-BMM with the worker's `step_adapters_ref`.
+- Per step: main dispatches `(op, batched_tokens, [kv_pos,] step_adapters)` to worker (non-blocking), runs train_fwd locally, waits for worker's batched next tokens, then runs bwd+opt.
 
-### v1 fusion
-- `fused_linear()`: cats infer+train along seq dim → single base weight matmul → split → detach infer path. LoRA adapters applied separately per path.
-- `attn_forward()`: fused QKV/O projections, separate RoPE + flash_attn_func (handles GQA natively, no repeat_interleave)
-- `mlp_forward()`: fused gate/up/down projections, separate SiLU activation
+### v0_compile
+- Piecewise CUDA graph: `LlamaAttention.forward` + `create_causal_mask` disabled from compile → attention runs eagerly; MLP/norms/embed/lm_head are CUDA-graphed.
+- DynamicCache batch=2 for both inference requests. Prefill uncompiled; decode compiled at static `(2, 1)` input shape.
+- Same compiled `PeftModel` is used for both decode (infer via `GBMM_STEP_ADAPTERS` path) and train (`set_adapter("ft")`). Dynamo specializes on the `GBMM_STEP_ADAPTERS` flag so each mode gets its own cached compile (amortized after warmup).
 
-### v2 custom backward
-- `FusedBaseLinear(torch.autograd.Function)`: forward identical to v1 (fused matmul), backward only computes `dL/d(train_x) = grad_train @ weight` on L_t tokens, skipping L_i inference tokens entirely.
-
-### v3 SGMV Triton kernels
-- `_sgmv_shrink_kernel`: fused x @ A^T * scaling for both adapters in one Triton launch. Grid dim 1 = adapter_id. Stacked bf16 weights: (2, R, H).
-- `_sgmv_expand_kernel`: fused mid @ B^T for both adapters in one Triton launch, with ADD_INPUTS to accumulate onto base output. Stacked bf16 weights: (2, H_out, R).
-- `FusedLinearSGMV(torch.autograd.Function)`: forward = 1 cuBLAS (fused base) + 2 Triton (shrink + expand). Backward = bf16 LoRA gradients with recomputed train_mid (no large fp32 casts, 4 saved tensors instead of 5), matching v2 backward cost.
-- Pre-allocated bf16 stacked weight buffers (`_buf_cache`), updated via `.copy_()`. Buffers on class attribute (not through autograd) to avoid graph retention.
-
-### v0_compile: torch.compile + KV cache
-- Piecewise CUDA graph: `LlamaAttention.forward` + `create_causal_mask` disabled from compile → attention runs eagerly, MLP/norms get CUDA-graphed.
-- DynamicCache for decode: prefill (step 0) fills cache with full prompt uncompiled, steps 1+ decode 1 token/step via compiled HF forward with `past_key_values`.
-- `torch.compile(model, mode="reduce-overhead")` on the PEFT model — same compiled object for both decode (infer adapter) and train (ft adapter) via `set_adapter()`.
-- Decode static shape: `(1, 1)` input + KV cache. Train static shape: `(1, 300)`.
-
-### v3_compile: v3 SGMV + torch.compile + KV cache
-- Same scalar-arg SGMV Triton kernels as v3.py (2 adapters: infer + ft).
-- KV cache for infer path: `(1, cache_len, num_kv_heads, head_dim)`, grows by 1 token/step.
-- `@torch.compiler.disable` on `attn_forward` (contains flash_attn, SGMV Triton, KV cache mutation).
-- `torch.compile(coserving_forward, mode="reduce-overhead")` → CUDA graph for MLP/norms between disabled attention blocks.
-- Two `fused_linear` variants: `fused_linear_attn` (SGMV + FusedBaseLinear, eager) for attn projections, `fused_linear_mlp` (plain `proj(cat)`, compiled) for MLP + lm_head.
-- Static decode fused shape: `(1, 1+300)` = `(1, 301)` for all decode steps. Prefill shape: `(1, prompt_len+300)`.
-- v3_compile preserves all v3 optimizations: FusedLinearSGMV (bf16 backward, recomputed train_mid), FusedBaseLinear (train-only backward), SGMV kernel launch reduction (224→112 cuBLAS → Triton).
+### v3_compile
+- Same SGMV kernels as v3.py (two adapter pointers + tl.where routing).
+- KV cache for infer path: `(2, cache_len, num_kv_heads, head_dim)`, grows by 1 per decode step (one token per request).
+- `@torch.compiler.disable` on `attn_forward` (flash_attn + SGMV + KV cache mutation run eagerly).
+- `torch.compile(coserving_forward, mode="reduce-overhead")` → CUDA graph for embed, layernorms, MLP, lm_head between the disabled attention blocks.
+- Two `fused_linear` variants: `fused_linear_attn` (SGMV + `FusedBaseLinear`, eager, inside disabled attn) and `fused_linear_mlp` (plain `proj(cat)` with `B_i*L_i` flatten/unflatten, compile-friendly) for MLP + lm_head.
+- Static decode fused shape: `(1, 2*1 + 300) = (1, 302)` — constant across decode steps, so the CUDA graph replays cleanly.
+- Segment tensors are rebuilt each iteration via `_set_segments(...)` in the main loop (outside the compiled region) and attached to `FusedLinearSGMV` class attrs; keeps `torch.tensor([...])` out of the Dynamo trace while still letting the kernel see up-to-date metadata on each call.
+- Preserves every v3 optimization: direct infer access, bf16 backward with recomputed train_mid, train-only backward, 2-Triton-launch LoRA.
