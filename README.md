@@ -27,7 +27,7 @@ conda activate baseline
 ```
 [Install PyTorch 2.4.0 from scratch](https://github.com/pytorch/pytorch/tree/v2.4.0?tab=readme-ov-file#from-source)
 ```
-# conda install -c conda-forge libstdcxx-ng
+# conda install -c conda-forge libstdcxx-ng=13
 # export CUDA_HOME=/usr/local/cuda-12.6
 # export PATH=$CUDA_HOME/bin:$PATH
 # export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
@@ -75,7 +75,7 @@ conda activate lms
 ```
 Install customized PyTorch 2.4.0
 ```
-# conda install -c conda-forge libstdcxx-ng
+# conda install -c conda-forge libstdcxx-ng=13
 # export CUDA_HOME=/usr/local/cuda-12.6
 # export PATH=$CUDA_HOME/bin:$PATH
 # export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
@@ -155,8 +155,8 @@ please use `python python_only_dev.py` before execution, and `python python_only
 These two commands allow users to switch between vanilla vLLM and FineInfer.
 NVIDIA MPS has a negligible impact on temporal sharing and is therefore not enabled.
 ```
-cd FineInfer
 conda activate baseline
+cd ~
 git clone -b vllm-v0.6.3-fineinfer https://github.com/llm-db/llmstation.git vllm-v0.6.3-fineinfer
 cd vllm-v0.6.3-fineinfer
 python python_only_dev.py
@@ -166,6 +166,7 @@ python python_only_dev.py --quit-dev
   - For Figure 10, you only need to adjust _fineinfer defer_  until the PEFT throughput is the same as points on the X-axis.
   - For Figure 13, you need to adjust LoRA distribution, LoRA rank, and _fineinfer defer_.
 ```
+cd FineInfer
 cd fig8a
 # ./run.sh <download dir> <request rate> <fineinfer defer>
 ./run.sh $HOME/scratch 1 0.1
@@ -228,24 +229,29 @@ Then you will find that LLMStation can surpass all baselines while meeting the S
 ```
 cd fig8a
 # ./run.sh <download dir> <request rate> <forward tasklets> <forward wait> <backward tasklets> <backward wait>
-./run.sh $HOME/scratch 1 8 0.005 4 0.002
+./run.sh $HOME/scratch 1 8 0.005 8 0.005
 cd fig9a
 # ./run.sh <download dir> <request rate> <forward tasklets> <forward wait> <backward tasklets> <backward wait>
-./run.sh $HOME/scratch 1 8 0.005 4 0.002
+./run.sh $HOME/scratch 1 8 0.005 8 0.005
 cd fig10
 # ./run.sh <download dir> <forward tasklets> <forward wait> <backward tasklets> <backward wait>
-./run.sh $HOME/scratch 8 0.005 4 0.002
+./run.sh $HOME/scratch 8 0.005 8 0.005
 cd fig13
 # ./run.sh <download dir> <LoRA distribution> <LoRA rank> <forward tasklets> <forward wait> <backward tasklets> <backward wait>
-./run.sh $HOME/scratch "uniform" 8 8 0.005 4 0.002
+./run.sh $HOME/scratch "uniform" 8 8 0.005 8 0.005
 ```
   - For Figure 12, in order to make the number of pauses for each forward pass or backward pass greater than the number of layers,
     you may need to adjust the number [here](https://github.com/llm-db/llmstation/blob/pytorch-v2.4.0-lms/torch/csrc/autograd/engine.cpp#L902) and then re-install PyTorch.
     If the number of pauses required for each forward or backward pass is less than the number of layers,
     you just need to use the previous scripts and adjust _forward_tasklets_ and _backward_tasklets_.
 ```
+cd fig12
 # ./run.sh <download dir>
 ./run.sh $HOME/scratch
+```
+  - For fused operators and kernels
+```
+git clone -b lms-fusion https://github.com/llm-db/llmstation.git lms-fusion
 ```
 
 ### Other issues
