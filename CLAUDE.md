@@ -23,7 +23,7 @@ Per step:
 | `hf_peft.py` | Pure LoRA training benchmark (reference, seq_len=300) |
 | `hf_coserving_v0.py` | Naive co-serving: batched 2-request decode via **gather-BMM** (per-step dynamic adapter stacking monkey-patched into PEFT's LoraLinear) + separate PEFT training step |
 | `hf_coserving_v0s.py` | v0 + multiprocessing (spawn + CUDA IPC): batched decode in worker ‖ train_fwd in main process, then bwd+opt sequentially |
-| `hf_coserving_v1.py` | Matrix-level fusion: infer `(B_i, L_i, H)` flattened and concatenated with train `(1, L_t, H)` for a single base matmul; infer LoRA via **gather-BMM**, train LoRA via ft adapter |
+| `hf_coserving_v1.py` | Matrix-level fusion: infer `(B_i, L_i, H)` flattened and concatenated with train `(1, L_t, H)` for a single base matmul; infer LoRA via gather-BMM, train LoRA via ft adapter |
 | `hf_coserving_v2.py` | v1 + `FusedBaseLinear` custom autograd: train-only backward skips the `B_i*L_i` infer tokens |
 | `hf_coserving_v3.py` | v2 fusion + **SGMV Triton kernels** (shrink + expand). 3 segments (2 infer + 1 train) → 2 unique adapter slots. Infer adapter read directly from PEFT `Parameter` storage (no stacking, no per-request duplication); only a minimal bf16 buffer for ft's fp32→bf16 dtype cast. Per-segment metadata passed as int32/fp32 tensors |
 | `hf_coserving_v0_compile.py` | v0 + `torch.compile(mode="reduce-overhead")` piecewise CUDA graph + DynamicCache batch=2 |
@@ -46,7 +46,7 @@ Per step:
 | inference (1 req, KV cache) | 30.35 | — | — | 30.35 | (ref) |
 | peft (train only) | — | 129.43 | 138.43 | 267.86 | (ref) |
 | v0 (gather-BMM naive) | 36.61 | 130.07 | 139.38 | 306.06 | baseline |
-| v0s (gather-BMM, decode‖train, +MPS) | parallel wall 142.46 | — | 138.38 | **280.84** | −8.2% |
+| v0s (gather-BMM, decode‖train, +MPS) | parallel wall 142.46 | — | 138.38 | 280.84 | −8.2% |
 | v1 (gather-BMM + fusion) | 129.70 | — | 141.17 | 270.87 | −11.5% |
 | v2 (+ train-only backward) | 129.94 | — | 137.92 | 267.86 | −12.5% |
 | v3 (SGMV, direct infer access) | 127.00 | — | 137.67 | **264.67** | −13.5% |
@@ -56,7 +56,7 @@ Per step:
 Notes:
 - Baselines: **v0** (non-compile) and **v0_compile** (compile). peft is a training-only reference and is not treated as a baseline.
 - In v0/v0s/v0_compile the decode is a standalone batched `(2, 1)` forward and train_fwd is a separate call; in v1/v2/v3/v3_compile both are concatenated into one fused matmul (`fused_fwd`).
-- v0s + **CUDA MPS wins** on 3090 (−8.2% vs v0): MPS lets the two processes' kernels coexist on the SMs instead of time-slicing at the CUDA-context level, so decode‖train_fwd overlap is clean. Without MPS the same setup still wins on 3090 (−3.1%, 296.47 ms) thanks to 3090's 936 GB/s HBM keeping contention mild; on L4 (300 GB/s) without MPS it lost by +2.3%. MPS usage: start daemon with `CUDA_VISIBLE_DEVICES=2 nvidia-cuda-mps-control -d`, run python with `CUDA_VISIBLE_DEVICES=0` (daemon remaps its single visible GPU to index 0 for clients) — see Architecture notes for the setup recipe and pitfalls.
+- v0s (NVIDIA MPS) wins on 3090 (−8.2% vs v0): MPS lets the two processes' kernels coexist on the SMs instead of time-slicing at the CUDA-context level, so decode‖train_fwd overlap is clean. Without MPS the same setup still wins on 3090 (−3.1%, 296.47 ms) thanks to 3090's 936 GB/s HBM keeping contention mild; on L4 (300 GB/s) without MPS it lost by +2.3%. MPS usage: start daemon with `CUDA_VISIBLE_DEVICES=2 nvidia-cuda-mps-control -d`, run python with `CUDA_VISIBLE_DEVICES=0` (daemon remaps its single visible GPU to index 0 for clients) — see Architecture notes for the setup recipe and pitfalls.
 - v3 is the fastest non-compile variant (−13.5% vs v0); v3_compile is the fastest overall (−12.7% vs v0_compile).
 - Relative gains are smaller than the 3B/L4 numbers in git history (v3 was −22.1%, v3_compile −22.4%). 8B's larger base matmul (hidden 4096, inter 14336) dominates each step, shrinking the relative impact of LoRA-side and backward-side optimizations.
 
@@ -64,8 +64,8 @@ Notes:
 
 ## Why each version is faster than the previous
 
-### v0s: multiprocessing with shared GPU + CUDA MPS (−25.22 ms, −8.2% vs v0)
-Spawn + CUDA IPC puts two processes on the same physical GPU memory and runs the batched 2-request decode in parallel with train_fwd. CUDA MPS (Multi-Process Service) lets both processes' kernels run concurrently on the SMs instead of time-slicing at the CUDA-context level, which is what actually turns the "parallel wall" into a meaningful saving. Per-op inflation under MPS is modest (decode 36.6 → 45.0 ms, ~1.23×; train_fwd 130.1 → 141.4 ms, ~1.09×), and the sequential sum 36.6+130.1=166.7 ms collapses to parallel wall 142.5 ms — an overlap saving of ~44 ms (13.5% of v0-equivalent cost). Without MPS the same setup saves only ~9 ms (inflation climbs to ~1.36× / 1.20×, parallel wall 157.4 ms) because the two processes context-switch at coarse granularity instead of sharing SMs. On L4 (300 GB/s) without MPS the setup lost (+2.3%) because lower HBM bandwidth amplified contention to ~1.5–2×; MPS on lower-bandwidth GPUs is worth re-measuring.
+### v0s: NVIDIA MPS (−25.22 ms, −8.2% vs v0)
+Spawn + CUDA IPC puts two processes on the same physical GPU memory and runs the batched 2-request decode in parallel with train_fwd. NVIDIA MPS (Multi-Process Service) lets both processes' kernels run concurrently on the SMs instead of time-slicing at the CUDA-context level, which is what actually turns the "parallel wall" into a meaningful saving. Per-op inflation under MPS is modest (decode 36.6 → 45.0 ms, ~1.23×; train_fwd 130.1 → 141.4 ms, ~1.09×), and the sequential sum 36.6+130.1=166.7 ms collapses to parallel wall 142.5 ms — an overlap saving of ~44 ms (13.5% of v0-equivalent cost). Without MPS the same setup saves only ~9 ms (inflation climbs to ~1.36× / 1.20×, parallel wall 157.4 ms) because the two processes context-switch at coarse granularity instead of sharing SMs. On L4 (300 GB/s) without MPS the setup lost (+2.3%) because lower HBM bandwidth amplified contention to ~1.5–2×; MPS on lower-bandwidth GPUs is worth re-measuring.
 
 ### v0 → v1: matrix-level fusion (−35.19 ms, −11.5% vs v0)
 v0 runs decode and train as fully separate forward passes — every base weight matrix is read from HBM twice per layer. v1 flattens the inference batch `(2, L_i, H) → (1, 2*L_i, H)` and concatenates with the training tokens `(1, L_t, H)` along the sequence dim for a single base-weight matmul covering both. Halves HBM bandwidth on the dominant base-weight loads. Infer LoRA uses gather-BMM; train LoRA keeps the ft adapter via PEFT.
@@ -119,7 +119,22 @@ Segment-based routing with direct adapter pointers:
 - KV cache per layer: `(B_i, kv_len, num_kv_heads, head_dim)`; grows by `L_i` per step.
 - v2 replaces the fused base matmul with `FusedBaseLinear(torch.autograd.Function)` whose backward only propagates through the train slice of the concatenated tensor.
 
-### v0s multiprocessing (+ CUDA MPS)
+### v0_compile
+- Piecewise CUDA graph: `LlamaAttention.forward` + `create_causal_mask` disabled from compile → attention runs eagerly; MLP/norms/embed/lm_head are CUDA-graphed.
+- DynamicCache batch=2 for both inference requests. Prefill uncompiled; decode compiled at static `(2, 1)` input shape.
+- Same compiled `PeftModel` is used for both decode (infer via `GBMM_STEP_ADAPTERS` path) and train (`set_adapter("ft")`). Dynamo specializes on the `GBMM_STEP_ADAPTERS` flag so each mode gets its own cached compile (amortized after warmup).
+
+### v3_compile
+- Same SGMV kernels as v3.py (two adapter pointers + tl.where routing).
+- KV cache for infer path: `(2, cache_len, num_kv_heads, head_dim)`, grows by 1 per decode step (one token per request).
+- `@torch.compiler.disable` on `attn_forward` (flash_attn + SGMV + KV cache mutation run eagerly).
+- `torch.compile(coserving_forward, mode="reduce-overhead")` → CUDA graph for embed, layernorms, MLP, lm_head between the disabled attention blocks.
+- Two `fused_linear` variants: `fused_linear_attn` (SGMV + `FusedBaseLinear`, eager, inside disabled attn) and `fused_linear_mlp` (plain `proj(cat)` with `B_i*L_i` flatten/unflatten, compile-friendly) for MLP + lm_head.
+- Static decode fused shape: `(1, 2*1 + 300) = (1, 302)` — constant across decode steps, so the CUDA graph replays cleanly.
+- Segment tensors are rebuilt each iteration via `_set_segments(...)` in the main loop (outside the compiled region) and attached to `FusedLinearSGMV` class attrs; keeps `torch.tensor([...])` out of the Dynamo trace while still letting the kernel see up-to-date metadata on each call.
+- Preserves every v3 optimization: direct infer access, bf16 backward with recomputed train_mid, train-only backward, 2-Triton-launch LoRA.
+
+### v0s (NVIDIA MPS)
 - Spawn + CUDA IPC to share ~480 tensors (params + buffers) between processes — both reference the same physical GPU memory.
 - Decode worker: builds the model on CPU, then rebinds every `param.data` / `buf.data` to the shared GPU tensor; also monkey-patches PEFT's LoraLinear for gather-BMM with the worker's `step_adapters_ref`.
 - Per step: main dispatches `(op, batched_tokens, [kv_pos,] step_adapters)` to worker (non-blocking), runs train_fwd locally, waits for worker's batched next tokens, then runs bwd+opt.
@@ -145,18 +160,3 @@ Segment-based routing with direct adapter pointers:
   - **Daemon uses physical index (`=2`), client uses `=0`.** Daemon remaps its single visible GPU to index 0 for clients; setting client `=2` makes MPS reject the client ("Client requested 2 which is not a valid GPU ID in the MPS visible set"), `torch.cuda.is_available()` returns False, gets cached by transformers' `is_torch_cuda_available` `@lru_cache`, and the FA2 check then raises a misleading `"FlashAttention2 is not available on CPU"`.
   - **Use numeric index, not UUID, for the daemon.** `CUDA_VISIBLE_DEVICES=GPU-<uuid>` works for torch clients but the MPS server's driver init fails to parse it (`Driver initialization failed with: no CUDA-capable device is detected`).
   - Ampere (sm_86) doesn't require `nvidia-smi -c EXCLUSIVE_PROCESS` (root-only); MPS works fine in default compute mode.
-
-### v0_compile
-- Piecewise CUDA graph: `LlamaAttention.forward` + `create_causal_mask` disabled from compile → attention runs eagerly; MLP/norms/embed/lm_head are CUDA-graphed.
-- DynamicCache batch=2 for both inference requests. Prefill uncompiled; decode compiled at static `(2, 1)` input shape.
-- Same compiled `PeftModel` is used for both decode (infer via `GBMM_STEP_ADAPTERS` path) and train (`set_adapter("ft")`). Dynamo specializes on the `GBMM_STEP_ADAPTERS` flag so each mode gets its own cached compile (amortized after warmup).
-
-### v3_compile
-- Same SGMV kernels as v3.py (two adapter pointers + tl.where routing).
-- KV cache for infer path: `(2, cache_len, num_kv_heads, head_dim)`, grows by 1 per decode step (one token per request).
-- `@torch.compiler.disable` on `attn_forward` (flash_attn + SGMV + KV cache mutation run eagerly).
-- `torch.compile(coserving_forward, mode="reduce-overhead")` → CUDA graph for embed, layernorms, MLP, lm_head between the disabled attention blocks.
-- Two `fused_linear` variants: `fused_linear_attn` (SGMV + `FusedBaseLinear`, eager, inside disabled attn) and `fused_linear_mlp` (plain `proj(cat)` with `B_i*L_i` flatten/unflatten, compile-friendly) for MLP + lm_head.
-- Static decode fused shape: `(1, 2*1 + 300) = (1, 302)` — constant across decode steps, so the CUDA graph replays cleanly.
-- Segment tensors are rebuilt each iteration via `_set_segments(...)` in the main loop (outside the compiled region) and attached to `FusedLinearSGMV` class attrs; keeps `torch.tensor([...])` out of the Dynamo trace while still letting the kernel see up-to-date metadata on each call.
-- Preserves every v3 optimization: direct infer access, bf16 backward with recomputed train_mid, train-only backward, 2-Triton-launch LoRA.
